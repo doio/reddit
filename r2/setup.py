@@ -43,6 +43,16 @@ else:
     pyx_extensions = cythonize(pyx_files)
 
 
+# guard against import errors in case this is the first run of setup.py and we
+# don't have any dependencies (including baseplate) yet
+try:
+    from baseplate.integration.thrift.command import ThriftBuildPyCommand
+except ImportError:
+    print "Cannot find Baseplate. Skipping Thrift build."
+else:
+    commands["build_py"] = ThriftBuildPyCommand
+
+
 setup(
     name="r2",
     version="",
@@ -76,13 +86,13 @@ setup(
         "pylibmc==1.2.2",
         "webob",
         "webtest",
+        "python-snappy",
+        "httpagentparser==1.7.8",
+        "raven",
     ],
-    # Extra dependencies that aren't needed for running the app.
-    # * https://pythonhosted.org/setuptools/setuptools.html#declaring-extras-optional-features-with-their-own-dependencies
-    # * https://github.com/pypa/sampleproject/blob/300f04dc44df51492deb859ac98ba521d2c7a17a/setup.py#L71-L77
-    extras_require={
-        'test': ['mock', 'nose'],
-    },
+    # setup tests (allowing for "python setup.py test")
+    tests_require=['mock', 'nose', 'coverage'],
+    test_suite="nose.collector",
     dependency_links=[
         "https://github.com/reddit/snudown/archive/v1.1.3.tar.gz#egg=snudown-1.1.3",
         "https://s3.amazonaws.com/code.reddit.com/pycaptcha-0.4.tar.gz#egg=pycaptcha-0.4",
@@ -109,6 +119,7 @@ setup(
     s3 = r2.lib.providers.media.s3:S3MediaProvider
     filesystem = r2.lib.providers.media.filesystem:FileSystemMediaProvider
     [r2.provider.cdn]
+    fastly = r2.lib.providers.cdn.fastly:FastlyCdnProvider
     cloudflare = r2.lib.providers.cdn.cloudflare:CloudFlareCdnProvider
     null = r2.lib.providers.cdn.null:NullCdnProvider
     [r2.provider.auth]
@@ -123,5 +134,8 @@ setup(
     imgix = r2.lib.providers.image_resizing.imgix:ImgixImageResizingProvider
     no_op = r2.lib.providers.image_resizing.no_op:NoOpImageResizingProvider
     unsplashit = r2.lib.providers.image_resizing.unsplashit:UnsplashitImageResizingProvider
+    [r2.provider.email]
+    null = r2.lib.providers.email.null:NullEmailProvider
+    mailgun = r2.lib.providers.email.mailgun:MailgunEmailProvider
     """,
 )

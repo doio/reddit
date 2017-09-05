@@ -27,10 +27,12 @@ import urllib
 from r2.config import feature
 from r2.models import *
 from filters import (
+    _force_unicode,
     _force_utf8,
     conditional_websafe,
     keep_space,
     unsafe,
+    double_websafe,
     websafe,
 )
 from r2.lib.cache_poisoning import make_poisoning_report_mac
@@ -49,6 +51,7 @@ import urlparse
 import calendar
 import math
 import time
+import pytz
 
 from pylons import request
 from pylons import tmpl_context as c
@@ -133,9 +136,11 @@ def make_url_https(url):
     return urlparse.urlunsplit(("https", netloc, path, query, fragment))
 
 
-def header_url(url):
+def header_url(url, absolute=False):
     if url == g.default_header_url:
-        return static(url)
+        return static(url, absolute=absolute)
+    elif absolute:
+        return make_url_https(url)
     else:
         return make_url_protocol_relative(url)
 
@@ -172,18 +177,53 @@ def js_config(extra_config=None):
     verification = mac.hexdigest()
     cur_subreddit = ""
     cur_sr_fullname = ""
+    cur_listing = ""
+    listing_over_18 = False
+    pref_no_profanity = not logged or c.user.pref_no_profanity
+    pref_media_preview = c.user.pref_media_preview
+
+    if not feature.is_enabled("autoexpand_media_previews"):
+        expando_preference = None
+    elif pref_media_preview == "subreddit":
+        expando_preference = "subreddit_default"
+    elif pref_media_preview == "on":
+        expando_preference = "auto_expand"
+    else:
+        expando_preference = "do_not_expand"
+
+    pref_beta = c.user.pref_beta
+    nsfw_media_acknowledged = logged and c.user.nsfw_media_acknowledged
+
     if isinstance(c.site, Subreddit) and not c.default_sr:
         cur_subreddit = c.site.name
         cur_sr_fullname = c.site._fullname
+        cur_listing = cur_subreddit
+        listing_over_18 = c.site.over_18
+    elif isinstance(c.site, DefaultSR):
+        cur_listing = "frontpage"
+    elif isinstance(c.site, FakeSubreddit):
+        cur_listing = c.site.name
+
+    if g.debug:
+        events_collector_url = g.events_collector_test_url
+        events_collector_key = g.secrets['events_collector_test_js_key']
+        events_collector_secret = g.secrets['events_collector_test_js_secret']
+    else:
+        events_collector_url = g.events_collector_url
+        events_collector_key = g.secrets['events_collector_js_key']
+        events_collector_secret = g.secrets['events_collector_js_secret']
 
     config = {
         # is the user logged in?
         "logged": logged,
         # logged in user's id
         "user_id": user_id,
+        # is user in timeout?
+        "user_in_timeout": user_in_timeout,
         # the subreddit's name (for posts)
         "post_site": cur_subreddit,
         "cur_site": cur_sr_fullname,
+        "cur_listing": cur_listing,
         # the user's voting hash
         "modhash": c.modhash or False,
         # the current rendering style
@@ -194,9 +234,9 @@ def js_config(extra_config=None):
         'store_visits': gold and c.user.pref_store_visits,
 
         # current domain
-        "cur_domain": get_domain(cname=c.frameless_cname, subreddit=False, no_www=True),
+        "cur_domain": get_domain(subreddit=False, no_www=True),
         # where do ajax requests go?
-        "ajax_domain": get_domain(cname=c.authorized_cname, subreddit=False),
+        "ajax_domain": get_domain(subreddit=False),
         "stats_domain": g.stats_domain or '',
         "stats_sample_rate": g.stats_sample_rate or 0,
         "extension": c.extension,
@@ -223,9 +263,18 @@ def js_config(extra_config=None):
         "uitracker_url": g.uitracker_url,
         "eventtracker_url": g.eventtracker_url,
         "anon_eventtracker_url": g.anon_eventtracker_url,
+        "events_collector_url": events_collector_url,
+        "events_collector_key": events_collector_key,
+        "events_collector_secret": events_collector_secret,
+        "feature_screenview_events": feature.is_enabled('screenview_events'),
         "static_root": static(''),
         "over_18": bool(c.over18),
-        "new_window": bool(c.user.pref_newwindow),
+        "listing_over_18": listing_over_18,
+        "expando_preference": expando_preference,
+        "pref_no_profanity": pref_no_profanity,
+        "pref_beta": pref_beta,
+        "nsfw_media_acknowledged": nsfw_media_acknowledged,
+        "new_window": logged and bool(c.user.pref_newwindow),
         "mweb_blacklist_expressions": g.live_config['mweb_blacklist_expressions'],
         "gold": gold,
         "has_subscribed": logged and c.user.has_subscribed,
@@ -235,7 +284,8 @@ def js_config(extra_config=None):
           "actionName": route_name,
         },
         "facebook_app_id": g.live_config["facebook_app_id"],
-        "feature_tumblr_sharing": feature.is_enabled('tumblr_sharing'),
+        "feature_new_report_dialog": feature.is_enabled('new_report_dialog'),
+        "email_verified": logged and c.user.email and c.user.email_verified,
     }
 
     if g.tracker_url:
@@ -246,10 +296,6 @@ def js_config(extra_config=None):
 
     if extra_config:
         config.update(extra_config)
-
-    if feature.is_enabled('timeouts'):
-        # is user in timeout?
-        config["user_in_timeout"] = user_in_timeout
 
     hooks.get_hook("js_config").call(config=config)
 
@@ -397,12 +443,10 @@ def get_domain(cname=False, subreddit=True, no_www=False):
        behavior is to prepend "www." to the front of it (for akamai).
        This flag will optionally disable it.
 
-     * cname: whether to respect the value of c.cname and return
-       c.site.domain rather than g.domain as the host name.
+     * cname: deprecated.
 
-     * subreddit: if a cname is not used in the resulting path, flags
-       whether or not to append to the domain the subreddit path (sans
-       the trailing path).
+     * subreddit: flags whether or not to append to the domain the
+       subreddit path (without the trailing path).
 
     """
     # locally cache these lookups as this gets run in a loop in add_props
@@ -415,54 +459,23 @@ def get_domain(cname=False, subreddit=True, no_www=False):
     domain_prefix = c.domain_prefix or g.domain_prefix
 
     site = c.site
-    ccname = c.cname
 
     if not no_www and domain_prefix:
         domain = domain_prefix + "." + domain
 
-    if cname and ccname and site.domain:
-        domain = site.domain
-
     if hasattr(request, "port") and request.port:
         domain += ":" + str(request.port)
 
-    if (not ccname or not cname) and subreddit:
+    if subreddit:
         domain += site.path.rstrip('/')
 
     return domain
 
-def dockletStr(context, type, browser):
-    site_host = "%s://%s" % (g.default_scheme, get_domain())
-
-    if type == "serendipity!":
-        return site_host+"/random"
-    elif type == "submit":
-        return ("javascript:location.href='"+site_host+
-               "/submit?url='+encodeURIComponent(location.href)+'&title='+encodeURIComponent(document.title)")
-    elif type == "reddit toolbar":
-        return ("javascript:%20var%20h%20=%20window.location.href;%20h%20=%20'" +
-                site_host + "/s/'%20+%20escape(h);%20window.location%20=%20h;")
-    else:
-        # these are the linked/disliked buttons, which we have removed
-        # from the UI
-        return (("javascript:function b(){var u=encodeURIComponent(location.href);"
-                 "var i=document.getElementById('redstat')||document.createElement('a');"
-                 "var s=i.style;s.position='%(position)s';s.top='0';s.left='0';"
-                 "s.zIndex='10002';i.id='redstat';"
-                 "i.href='%(site_host)s/submit?url='+u+'&title='+"
-                 "encodeURIComponent(document.title);"
-                 "var q=i.firstChild||document.createElement('img');"
-                 "q.src='%(site_host)s/d/%(type)s.png?v='+Math.random()+'&uh=%(modhash)s&u='+u;"
-                 "i.appendChild(q);document.body.appendChild(i)};b()") %
-                dict(position = "absolute" if browser == "ie" else "fixed",
-                     site_host = site_host, type = type,
-                     modhash = c.modhash if c.user else ''))
-
-
 
 def add_sr(
         path, sr_path=True, nocname=False, force_hostname=False,
-        retain_extension=True, force_https=False):
+        retain_extension=True, force_https=False,
+        force_extension=None):
     """
     Given a path (which may be a full-fledged url or a relative path),
     parses the path and updates it to include the subreddit path
@@ -471,13 +484,10 @@ def add_sr(
      * sr_path: if a cname is not used for the domain, updates the
        path to include c.site.path.
 
-     * nocname: when updating the hostname, overrides the value of
-       c.cname to set the hostname to g.domain.  The default behavior
-       is to set the hostname consistent with c.cname.
+     * nocname: deprecated.
 
      * force_hostname: if True, force the url's hostname to be updated
-       even if it is already set in the path, and subject to the
-       c.cname/nocname combination.  If false, the path will still
+       even if it is already set in the path. If false, the path will still
        have its domain updated if no hostname is specified in the url.
 
      * retain_extension: if True, sets the extention according to
@@ -486,24 +496,26 @@ def add_sr(
      * force_https: force the URL scheme to https
 
     For caching purposes: note that this function uses:
-      c.cname, c.render_style, c.site.name
+      c.render_style, c.site.name
+
     """
     # don't do anything if it is just an anchor
     if path.startswith(('#', 'javascript:')):
         return path
 
     u = UrlParser(path)
-    if sr_path and (nocname or not c.cname):
+    if sr_path:
         u.path_add_subreddit(c.site)
 
     if not u.hostname or force_hostname:
-        u.hostname = get_domain(cname = (c.cname and not nocname),
-                                subreddit = False)
+        u.hostname = get_domain(subreddit=False)
 
     if (c.secure and u.is_reddit_url()) or force_https:
         u.scheme = "https"
 
-    if retain_extension:
+    if force_extension is not None:
+        u.set_extension(force_extension)
+    elif retain_extension:
         if c.render_style == 'mobile':
             u.set_extension('mobile')
 
@@ -581,8 +593,6 @@ def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
         cssclass = 'admin'
         if not label:
             label = _('reddit admin, speaking officially')
-        if not link:
-            link = '/about/team'
     elif kind in ('X', '@'):
         priority = 5
         cssclass = 'gray'
@@ -614,6 +624,45 @@ def add_attr(attrs, kind, label=None, link=None, cssclass=None, symbol=None):
     attrs.append( (priority, symbol, cssclass, label, link) )
 
 
+def add_admin_distinguish(distinguish_attribs_list):
+    add_attr(distinguish_attribs_list, 'A')
+
+
+def add_moderator_distinguish(distinguish_attribs_list, subreddit):
+    link = '/r/%s/about/moderators' % subreddit.name
+    label = _('moderator of /r/%(reddit)s, speaking officially')
+    label %= {'reddit': subreddit.name}
+    add_attr(distinguish_attribs_list, 'M', label=label, link=link)
+
+
+def add_friend_distinguish(distinguish_attribs_list, note=None):
+    if note:
+        label = u"%s (%s)" % (_("friend"), _force_unicode(note))
+    else:
+        label = None
+    add_attr(distinguish_attribs_list, 'F', label)
+
+
+def add_cakeday_distinguish(distinguish_attribs_list, user):
+    label = _("%(user)s just celebrated a reddit birthday!")
+    label %= {"user": user.name}
+    link = "/user/%s" % user.name
+    add_attr(distinguish_attribs_list, kind="cake", label=label, link=link)
+
+
+def add_special_distinguish(distinguish_attribs_list, user):
+    args = user.special_distinguish()
+    args.pop('name')
+    if not args.get('kind'):
+        args['kind'] = 'special'
+    add_attr(distinguish_attribs_list, **args)
+
+
+def add_submitter_distinguish(distinguish_attribs_list, link, subreddit):
+    permalink = link.make_permalink(subreddit)
+    add_attr(distinguish_attribs_list, 'S', link=permalink)
+
+
 def search_url(query, subreddit, restrict_sr="off", sort=None, recent=None, ref=None):
     import urllib
     query = _force_utf8(query)
@@ -633,20 +682,23 @@ def search_url(query, subreddit, restrict_sr="off", sort=None, recent=None, ref=
 
 def format_number(number, locale=None):
     if not locale:
-        locale = c.locale
+        locale = c.locale or g.locale
 
     return babel.numbers.format_number(number, locale=locale)
 
 
 def format_percent(ratio, locale=None):
-    return babel.numbers.format_percent(ratio, locale=locale or c.locale)
+    if not locale:
+        locale = c.locale or g.locale
+
+    return babel.numbers.format_percent(ratio, locale=locale)
 
 
 def html_datetime(date):
     # Strip off the microsecond to appease the HTML5 gods, since
     # datetime.isoformat() returns too long of a microsecond value.
     # http://www.whatwg.org/specs/web-apps/current-work/multipage/common-microsyntaxes.html#times
-    return date.replace(microsecond=0).isoformat()
+    return date.astimezone(pytz.UTC).replace(microsecond=0).isoformat()
 
 
 def js_timestamp(date):

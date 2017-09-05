@@ -50,6 +50,7 @@ from r2.lib import amqp, hooks
 from r2.lib.db.tdb_cassandra import NotFound
 from r2.lib.memoize import memoize
 from r2.lib.nymph import optimize_png
+from r2.lib.template_helpers import format_html
 from r2.lib.utils import (
     TimeoutFunction,
     TimeoutFunctionException,
@@ -70,6 +71,10 @@ from urllib2 import (
     HTTPError,
     URLError,
 )
+
+_IMAGE_PREVIEW_TEMPLATE = """
+<img class="%(css_class)s" src="%(url)s" width="%(width)s" height="%(height)s">
+"""
 
 
 def _image_to_str(image):
@@ -122,7 +127,51 @@ def _square_image(img):
     return _crop_image_vertically(img, width)
 
 
+def _apply_exif_orientation(image):
+    """Update the image's orientation if it has the relevant EXIF tag."""
+    try:
+        exif_tags = image._getexif() or {}
+    except AttributeError:
+        # image format with no EXIF tags
+        return image
+
+    # constant from EXIF spec
+    ORIENTATION_TAG_ID = 0x0112
+    orientation = exif_tags.get(ORIENTATION_TAG_ID)
+
+    if orientation == 1:
+        # 1 = Horizontal (normal)
+        pass
+    elif orientation == 2:
+        # 2 = Mirror horizontal
+        image = image.transpose(Image.FLIP_LEFT_RIGHT)
+    elif orientation == 3:
+        # 3 = Rotate 180
+        image = image.transpose(Image.ROTATE_180)
+    elif orientation == 4:
+        # 4 = Mirror vertical
+        image = image.transpose(Image.FLIP_TOP_BOTTOM)
+    elif orientation == 5:
+        # 5 = Mirror horizontal and rotate 90 CCW
+        image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        image = image.transpose(Image.ROTATE_90)
+    elif orientation == 6:
+        # 6 = Rotate 270 CCW
+        image = image.transpose(Image.ROTATE_270)
+    elif orientation == 7:
+        # 7 = Mirror horizontal and rotate 270 CCW
+        image = image.transpose(Image.FLIP_LEFT_RIGHT)
+        image = image.transpose(Image.ROTATE_270)
+    elif orientation == 8:
+        # 8 = Rotate 90 CCW
+        image = image.transpose(Image.ROTATE_90)
+
+    return image
+
+
 def _prepare_image(image):
+    image = _apply_exif_orientation(image)
+
     image = _square_image(image)
 
     if feature.is_enabled('hidpi_thumbnails'):
@@ -269,7 +318,8 @@ def upload_stylesheet(content):
 
 
 def _scrape_media(url, autoplay=False, maxwidth=600, force=False,
-                  save_thumbnail=True, use_cache=False, max_cache_age=None):
+                  save_thumbnail=True, use_cache=False, max_cache_age=None,
+                  use_youtube_scraper=False):
     media = None
     autoplay = bool(autoplay)
     maxwidth = int(maxwidth)
@@ -288,7 +338,8 @@ def _scrape_media(url, autoplay=False, maxwidth=600, force=False,
         media_object = secure_media_object = None
         thumbnail_image = thumbnail_url = thumbnail_size = None
 
-        scraper = Scraper.for_url(url, autoplay=autoplay)
+        scraper = Scraper.for_url(url, autoplay=autoplay,
+                                  use_youtube_scraper=use_youtube_scraper)
         try:
             thumbnail_image, preview_object, media_object, secure_media_object = (
                 scraper.scrape())
@@ -344,6 +395,16 @@ def _scrape_media(url, autoplay=False, maxwidth=600, force=False,
 
 def _get_scrape_url(link):
     if not link.is_self:
+        sr_name = link.subreddit_slow.name
+        if not feature.is_enabled("imgur_gif_conversion", subreddit=sr_name):
+            return link.url
+        p = UrlParser(link.url)
+        # If it's a gif link on imgur, replacing it with gifv should
+        # give us the embedly friendly video url
+        if is_subdomain(p.hostname, "imgur.com"):
+            if p.path_extension().lower() == "gif":
+                p.set_extension("gifv")
+                return p.unparse()
         return link.url
 
     urls = extract_urls_from_markdown(link.selftext)
@@ -363,8 +424,10 @@ def _get_scrape_url(link):
 
 
 def _set_media(link, force=False, **kwargs):
+    sr = link.subreddit_slow
+    
     # Do not process thumbnails for quarantined subreddits
-    if link.subreddit_slow.quarantine:
+    if sr.quarantine:
         return
 
     if not link.is_self:
@@ -384,7 +447,9 @@ def _set_media(link, force=False, **kwargs):
             link._commit()
         return
 
-    media = _scrape_media(scrape_url, force=force, **kwargs)
+    youtube_scraper = feature.is_enabled("youtube_scraper", subreddit=sr.name)
+    media = _scrape_media(scrape_url, force=force,
+                          use_youtube_scraper=youtube_scraper, **kwargs)
 
     if media and not link.promoted:
         # While we want to add preview images to self posts for the new apps,
@@ -439,6 +504,73 @@ def upload_icon(image_data, size):
     return g.media_provider.put('icons', file_name + ".png", icon_data)
 
 
+def allowed_media_preview_url(url):
+    p = UrlParser(url)
+    if p.has_static_image_extension():
+        return True
+    for allowed_domain in g.media_preview_domain_whitelist:
+        if is_subdomain(p.hostname, allowed_domain):
+            return True
+    return False
+
+
+def get_preview_image(preview_object, include_censored=False):
+    """Returns a media_object for rendering a media preview image"""
+    min_width, min_height = g.preview_image_min_size
+    max_width, max_height = g.preview_image_max_size
+    source_width = preview_object['width']
+    source_height = preview_object['height']
+
+    if source_width <= max_width and source_height <= max_height:
+        width = source_width
+        height = source_height
+    else:
+        max_ratio = float(max_height) / max_width
+        source_ratio = float(source_height) / source_width
+        if source_ratio >= max_ratio:
+            height = max_height
+            width = int((height * source_width) / source_height)
+        else:
+            width = max_width
+            height = int((width * source_height) / source_width)
+
+    if width < min_width and height < min_height:
+        return None
+
+    url = g.image_resizing_provider.resize_image(preview_object, width)
+    img_html = format_html(
+        _IMAGE_PREVIEW_TEMPLATE,
+        css_class="preview",
+        url=url,
+        width=width,
+        height=height,
+    )
+
+    if include_censored:
+        censored_url = g.image_resizing_provider.resize_image(
+            preview_object,
+            width,
+            censor_nsfw=True,
+        )
+        censored_img_html = format_html(
+            _IMAGE_PREVIEW_TEMPLATE,
+            css_class="censored-preview",
+            url=censored_url,
+            width=width,
+            height=height,
+        )
+        img_html += censored_img_html
+
+    media_object = {
+        "type": "media-preview",
+        "width": width,
+        "height": height,
+        "content": img_html,
+    }
+
+    return media_object
+
+
 def _make_custom_media_embed(media_object):
     # this is for promoted links with custom media embeds.
     return MediaEmbed(
@@ -461,6 +593,9 @@ def get_media_embed(media_object):
         return _make_custom_media_embed(media_object)
 
     if "oembed" in media_object:
+        if media_object.get("type") == "youtube.com":
+            return _YouTubeScraper.media_embed(media_object)
+
         return _EmbedlyScraper.media_embed(media_object)
 
 
@@ -498,10 +633,13 @@ class MediaEmbed(object):
 
 class Scraper(object):
     @classmethod
-    def for_url(cls, url, autoplay=False, maxwidth=600):
+    def for_url(cls, url, autoplay=False, maxwidth=600, use_youtube_scraper=False):
         scraper = hooks.get_hook("scraper.factory").call_until_return(url=url)
         if scraper:
             return scraper
+
+        if use_youtube_scraper and _YouTubeScraper.matches(url):
+            return _YouTubeScraper(url, maxwidth=maxwidth)
 
         embedly_services = _fetch_embedly_services()
         for service_re in embedly_services:
@@ -587,11 +725,11 @@ class _ThumbnailOnlyScraper(Scraper):
         # Graph protocol: http://ogp.me/
         og_image = (soup.find('meta', property='og:image') or
                     soup.find('meta', attrs={'name': 'og:image'}))
-        if og_image and og_image['content']:
+        if og_image and og_image.get('content'):
             return og_image['content'], None
         og_image = (soup.find('meta', property='og:image:url') or
                     soup.find('meta', attrs={'name': 'og:image:url'}))
-        if og_image and og_image['content']:
+        if og_image and og_image.get('content'):
             return og_image['content'], None
 
         # <link rel="image_src" href="http://...">
@@ -739,6 +877,89 @@ class _EmbedlyScraper(Scraper):
         width = oembed.get("width")
         height = oembed.get("height")
         public_thumbnail_url = oembed.get('thumbnail_url')
+        if not (html and width and height):
+            return
+
+        return MediaEmbed(
+            width=width,
+            height=height,
+            content=html,
+            public_thumbnail_url=public_thumbnail_url,
+        )
+
+
+class _YouTubeScraper(Scraper):
+    OEMBED_ENDPOINT = "https://www.youtube.com/oembed"
+    URL_MATCH = re.compile(r"https?://((www\.)?youtube\.com/watch|youtu\.be/)")
+
+    def __init__(self, url, maxwidth):
+        self.url = url
+        self.maxwidth = maxwidth
+
+    @classmethod
+    def matches(cls, url):
+        return cls.URL_MATCH.match(url)
+
+    def _fetch_from_youtube(self):
+        params = {
+            "url": self.url,
+            "format": "json",
+            "maxwidth": self.maxwidth,
+        }
+
+        with g.stats.get_timer("providers.youtube.oembed"):
+            content = requests.get(self.OEMBED_ENDPOINT, params=params).content
+
+        return json.loads(content)
+
+    def _make_media_object(self, oembed):
+        if oembed.get("type") == "video":
+            return {
+                "type": "youtube.com",
+                "oembed": oembed,
+            }
+        return None
+
+    def scrape(self):
+        oembed = self._fetch_from_youtube()
+        if not oembed:
+            return None, None, None, None
+        thumbnail_url = oembed.get("thumbnail_url")
+
+        if not thumbnail_url:
+            return None, None, None, None
+
+        _, content = _fetch_url(thumbnail_url, referer=self.url)
+        uid = _filename_from_content(content)
+        image = str_to_image(content)
+        storage_url = upload_media(image, category='previews')
+        width, height = image.size
+        preview_object = {
+            'uid': uid,
+            'url': storage_url,
+            'width': width,
+            'height': height,
+        }
+
+        thumbnail = _prepare_image(image)
+        media_object = self._make_media_object(oembed)
+
+        return (
+            thumbnail,
+            preview_object,
+            media_object,
+            media_object,
+        )
+
+    @classmethod
+    def media_embed(cls, media_object):
+        oembed = media_object["oembed"]
+
+        html = oembed.get("html")
+        width = oembed.get("width")
+        height = oembed.get("height")
+        public_thumbnail_url = oembed.get('thumbnail_url')
+
         if not (html and width and height):
             return
 

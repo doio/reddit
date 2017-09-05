@@ -57,6 +57,60 @@ def is_enabled(name, user=None, subreddit=None):
         oauth_client=oauth_client,
     )
 
+def variant(name, user=None):
+    """Return which variant of an experiment a user is part of.
+
+    If the experiment is not found, has no variants, or the user is not part of
+    any of them (control), return None.
+
+    :param name string - an experiment (feature) name
+    :param user - (optional) an Account.  Defaults to the currently signed in
+                  user.
+    :return string, or None if not part of an experiment
+    """
+    if not user:
+        user = _world.current_user()
+
+    return _get_featurestate(name).variant(user)
+
+def all_enabled(user=None):
+    """Return a list of enabled features and experiments for the user.
+    
+    Provides the user's assigned variant and the experiment ID for experiments.
+
+    This does not trigger bucketing events, so it should not be used for
+    feature flagging purposes on the server. It is meant to let clients
+    condition features on experiment variants. Those clients should manually
+    send the appropriate bucketing events.
+
+    This does not include page-based experiments, which operate independently
+    of the particular user.
+
+    :param user - (optional) an Account. Defaults to None, for which we
+                  determine logged-out features.
+    :return dict - a dictionary mapping enabled feature keys to True or to the
+                   experiment/variant information
+    """
+    features = FeatureState.get_all(_world)
+
+    # Get enabled features and experiments
+    active = {}
+    for feature in features:
+        experiment = feature.config.get('experiment')
+        # Exclude page experiments
+        if experiment and FeatureState.is_user_experiment(experiment):
+            # Get experiment names, ids, and assigned variants, leaving out
+            # experiments for which this user is excluded
+            variant = feature.variant(user)
+            if variant:
+                active[feature.name] = {
+                    'experiment_id': experiment.get('experiment_id'),
+                    'variant': variant
+                }
+        elif feature.is_enabled(user):
+                active[feature.name] = True
+
+    return active
 
 @feature_hooks.on('worker.live_config.update')
 def clear_featurestate_cache():
@@ -70,7 +124,10 @@ def _get_featurestate(name):
     :param name string - a given feature name
     :return FeatureState
     """
-    if name not in _featurestate_cache:
-        _featurestate_cache[name] = FeatureState(name, _world)
 
-    return _featurestate_cache[name]
+    featurestate = _featurestate_cache.get(name, None)
+    if featurestate is None:
+        featurestate = FeatureState(name, _world)
+        _featurestate_cache[name] = featurestate
+
+    return featurestate

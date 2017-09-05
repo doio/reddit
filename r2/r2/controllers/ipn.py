@@ -38,7 +38,6 @@ from r2.lib.emailer import _system_email
 from r2.lib.errors import MessageError
 from r2.lib.filters import _force_unicode, _force_utf8
 from r2.lib.hooks import get_hook
-from r2.lib.log import log_text
 from r2.lib.pages import GoldGiftCodeEmail
 from r2.lib.strings import strings
 from r2.lib.utils import constant_time_compare, randstr, timeago
@@ -142,25 +141,12 @@ def check_payment_status(payment_status):
     if psl == 'completed':
         return (None, psl)
     elif psl == 'refunded':
-        log_text("refund", "Just got notice of a refund.", "info")
-        # TODO: something useful when this happens -- and don't
-        # forget to verify first
         return ("Ok", psl)
     elif psl == 'pending':
-        log_text("pending",
-                 "Just got notice of a Pending, whatever that is.", "info")
-        # TODO: something useful when this happens -- and don't
-        # forget to verify first
         return ("Ok", psl)
     elif psl == 'reversed':
-        log_text("reversal",
-                 "Just got notice of a PayPal reversal.", "info")
-        # TODO: something useful when this happens -- and don't
-        # forget to verify first
         return ("Ok", psl)
     elif psl == 'canceled_reversal':
-        log_text("canceled_reversal",
-                 "Just got notice of a PayPal 'canceled reversal'.", "info")
         return ("Ok", psl)
     elif psl == 'failed':
         return ("Ok", psl)
@@ -179,12 +165,8 @@ def check_txn_type(txn_type, psl):
     elif txn_type == 'subscr_eot':
         return ("Ok", None)
     elif txn_type == 'subscr_failed':
-        log_text("failed_subscription",
-                 "Just got notice of a failed PayPal resub.", "info")
         return ("Ok", None)
     elif txn_type == 'subscr_modify':
-        log_text("modified_subscription",
-                 "Just got notice of a modified PayPal sub.", "info")
         return ("Ok", None)
     elif txn_type == 'send_money':
         return ("Ok", None)
@@ -284,9 +266,9 @@ def send_gift(buyer, recipient, months, days, signed, giftmessage,
         md_sender = "/u/%s" % sender
         repliable = True
     else:
-        sender = _("An anonymous redditor")
-        md_sender = _("An anonymous redditor")
-        
+        sender = "An anonymous redditor"
+        md_sender = "An anonymous redditor"
+
         if buyer.name in g.live_config["proxy_gilding_accounts"]:
             repliable = False
         else:    
@@ -300,16 +282,16 @@ def send_gift(buyer, recipient, months, days, signed, giftmessage,
         amount = "%d months" % months
 
     if not thing:
-        subject = _('Let there be gold! %s just sent you reddit gold!') % sender
+        subject = 'Let there be gold! %s just sent you reddit gold!' % sender
         message = strings.youve_got_gold % dict(sender=md_sender, amount=amount)
     else:
         url = thing.make_permalink_slow()
         if isinstance(thing, Comment):
-            subject = _('Your comment has been gilded!')
+            subject = 'Your comment has been gilded!'
             message = strings.youve_been_gilded_comment 
             message %= {'sender': md_sender, 'url': url}
         else:
-            subject = _('Your submission has been gilded!')
+            subject = 'Your submission has been gilded!'
             message = strings.youve_been_gilded_link 
             message %= {'sender': md_sender, 'url': url}
 
@@ -319,7 +301,7 @@ def send_gift(buyer, recipient, months, days, signed, giftmessage,
 
     message += '\n\n' + strings.gold_benefits_msg
     if g.lounge_reddit:
-        message += '\n* ' + strings.lounge_msg
+        message += '\n\n' + strings.lounge_msg
     message = append_random_bottlecap_phrase(message)
 
     if not signed:
@@ -484,9 +466,6 @@ class IpnController(RedditController):
         # Make sure it's really PayPal
         if not constant_time_compare(paypal_secret,
                                      g.secrets['paypal_webhook']):
-            log_text("invalid IPN secret",
-                     "%s guessed the wrong IPN secret" % request.ip,
-                     "warning")
             raise ValueError
 
         # Return early if it's an IPN class we don't care about
@@ -507,11 +486,6 @@ class IpnController(RedditController):
 
         if response:
             return response
-
-        # Check for the debug flag, and if so, dump the IPN dict
-        if g.cache.get("ipn-debug"):
-            g.cache.delete("ipn-debug")
-            dump_parameters(parameters)
 
         if mc_currency != 'USD':
             raise ValueError("Somehow got non-USD IPN %r" % mc_currency)
@@ -534,6 +508,11 @@ class IpnController(RedditController):
                 except IntegrityError:
                     return "Ok"
                 admintools.adjust_gold_expiration(existing, days=days)
+
+                subject, message = subscr_pm(pennies, months, new_subscr=False)
+                message = append_random_bottlecap_phrase(message)
+                send_system_message(existing.name, subject, message,
+                                    distinguished='gold-auto')
 
                 g.log.info("Just applied IPN renewal for %s, %d days" %
                            (existing.name, days))
@@ -581,18 +560,20 @@ class IpnController(RedditController):
             buyer.gold_subscr_id = subscr_id
 
         instagift = False
-        if payment_blob['goldtype'] in ('autorenew', 'onetime'):
+        if payment_blob['goldtype'] == 'onetime':
             admintools.adjust_gold_expiration(buyer, days=days)
 
             subject = _("Eureka! Thank you for investing in reddit gold!")
-            
             message = _("Thank you for buying reddit gold. Your patronage "
                         "supports the site and makes future development "
                         "possible. For example, one month of reddit gold "
                         "pays for 5 instance hours of reddit's servers.")
             message += "\n\n" + strings.gold_benefits_msg
             if g.lounge_reddit:
-                message += "\n* " + strings.lounge_msg
+                message += "\n\n" + strings.lounge_msg
+        elif payment_blob['goldtype'] == 'autorenew':
+            admintools.adjust_gold_expiration(buyer, days=days)
+            subject, message = subscr_pm(pennies, months, new_subscr=True)
         elif payment_blob['goldtype'] == 'creddits':
             buyer._incr("gold_creddits", months)
             buyer._commit()
@@ -840,8 +821,8 @@ class GoldPaymentController(RedditController):
             return
 
         gold_recipient = recipient or buyer
-        with gold_lock(gold_recipient):
-            gold_recipient._sync_latest()
+        with gold_recipient.get_read_modify_write_lock() as lock:
+            gold_recipient.update_from_cache(lock)
 
             secret_pieces = [goldtype]
             if goldtype == 'gift':
@@ -858,12 +839,11 @@ class GoldPaymentController(RedditController):
                     else:
                         message = ":)"
                 else:
-                    subject = "your reddit gold has been renewed!"
-                    message = ("see the details of your subscription on "
-                               "[your userpage](/u/%s)" % buyer.name)
-
                     if has_prev_subscr_payments(subscr_id):
                         secret = None
+                        subject, message = subscr_pm(pennies, months, new_subscr=False)
+                    else:
+                        subject, message = subscr_pm(pennies, months, new_subscr=True)
 
             elif goldtype == 'creddits':
                 buyer._incr('gold_creddits', months)
@@ -947,6 +927,7 @@ class StripeController(GoldPaymentController):
         'customer.subscription.deleted': 'deleted_subscription',
         'customer.subscription.trial_will_end': 'noop',
         'customer.subscription.updated': 'noop',
+        'review.opened': 'noop',
         'dummy': 'noop',
     }
 
@@ -1338,10 +1319,6 @@ def validate_blob(custom):
     return ret
 
 
-def gold_lock(user):
-    return g.make_lock('gold_purchase', 'gold_%s' % user._id)
-
-
 def days_from_months(months):
     if months >= 12:
         assert months % 12 == 0
@@ -1386,8 +1363,8 @@ def reverse_gold_purchase(transaction_id):
         recipient = Account._by_name(recipient_name)
 
     gold_recipient = recipient or buyer
-    with gold_lock(gold_recipient):
-        gold_recipient._sync_latest()
+    with gold_recipient.get_read_modify_write_lock() as lock:
+        gold_recipient.update_from_cache(lock)
 
         if goldtype in ('onetime', 'autorenew'):
             subtract_gold_days(buyer, days)
@@ -1409,3 +1386,43 @@ def cancel_stripe_subscription(customer_id):
         return customer
     customer.delete()
     return customer
+
+
+def subscr_pm(pennies, months, new_subscr=True):
+    price = "$%0.2f" % (pennies/100.0)
+    if new_subscr:
+        if months % 12 == 0:
+            message = _("You have created a yearly Reddit Gold subscription "
+                "for %(price)s per year.\n\nThis subscription will renew "
+                "automatically yearly until you cancel. You may cancel your "
+                "subscription at any time by visiting %(subscr_url)s.\n\n")
+        else:
+            message = _("You have created a monthly Reddit Gold subscription "
+                "for %(price)s per month.\n\nThis subscription will renew "
+                "automatically monthly until you cancel. You may cancel your "
+                "subscription at any time by visiting %(subscr_url)s.\n\n")
+    else:
+        if months == 1:
+            message = _("Your Reddit Gold subscription has been renewed "
+                "for 1 month for %(price)s.\n\nThis subscription will renew "
+                "automatically monthly until you cancel. You may cancel your "
+                "subscription at any time by visiting %(subscr_url)s.\n\n")
+        else:
+            message = _("Your Reddit Gold subscription has been renewed "
+                "for 1 year for %(price)s.\n\nThis subscription will renew "
+                "automatically yearly until you cancel. You may cancel your "
+                "subscription at any time by visiting %(subscr_url)s.\n\n")
+
+    subject = _("Reddit Gold Subscription")
+    message += _("If you cancel, you will not be billed for any additional "
+        "months of service, and service will continue until the end of the "
+        "billing period. If you cancel, you will not receive a refund for any "
+        "service already paid for.\n\nIf you have any questions, please "
+        "contact %(gold_email)s.")
+
+    message %= {
+        "price": price,
+        "subscr_url": "https://www.reddit.com/gold/subscription",
+        "gold_email": g.goldsupport_email,
+    }
+    return subject, message

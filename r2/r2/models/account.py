@@ -20,46 +20,48 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-import random
-
-from r2.config import feature
-from r2.lib.db.thing     import Thing, Relation, NotFound
-from r2.lib.db.operators import lower
-from r2.lib.db.userrel   import UserRel
-from r2.lib.db           import tdb_cassandra
-from r2.lib.memoize      import memoize
-from r2.lib.utils        import randstr, timefromnow
-from r2.lib.utils        import UrlParser
-from r2.lib.utils        import constant_time_compare, canonicalize_email
-from r2.lib import amqp, filters, hooks
-from r2.lib.log import log_text
-from r2.models.bans import TempTimeout
-from r2.models.last_modified import LastModified
-from r2.models.modaction import ModAction
-from r2.models.trylater import TryLater
+import bcrypt
+from collections import Counter, OrderedDict
+from datetime import datetime, timedelta
+import hashlib
+import hmac
+import time
 
 from pylons import request
 from pylons import tmpl_context as c
 from pylons import app_globals as g
-from pylons.i18n import _
-import time
-import hashlib
-from collections import Counter, OrderedDict
-from copy import copy
-from datetime import datetime, timedelta
-import bcrypt
-import hmac
-import hashlib
-from pycassa.system_manager import ASCII_TYPE
+from pycassa.system_manager import ASCII_TYPE, DATE_TYPE, UTF8_TYPE
+
+from r2.config import feature
+from r2.lib import amqp, filters, hooks
+from r2.lib.db.thing import Thing, Relation, NotFound
+from r2.lib.db.operators import lower
+from r2.lib.db.userrel import UserRel
+from r2.lib.db import tdb_cassandra
+from r2.lib.memoize import memoize
+from r2.lib.utils import (
+    randstr,
+    UrlParser,
+    constant_time_compare,
+    canonicalize_email,
+    tup,
+)
+from r2.models.bans import TempTimeout
+from r2.models.last_modified import LastModified
+from r2.models.modaction import ModAction
+from r2.models.trylater import TryLater
 
 
 trylater_hooks = hooks.HookRegistrar()
 COOKIE_TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S'
 
 
-class AccountExists(Exception): pass
+class AccountExists(Exception):
+    pass
+
 
 class Account(Thing):
+    _cache = g.thingcache
     _data_int_props = Thing._data_int_props + ('link_karma', 'comment_karma',
                                                'report_made', 'report_correct',
                                                'report_ignored', 'spammer',
@@ -124,9 +126,11 @@ class Account(Thing):
                      sort_options = {},
                      has_subscribed = False,
                      pref_media = 'subreddit',
+                     pref_media_preview = 'subreddit',
                      wiki_override = None,
                      email = "",
                      email_verified = False,
+                     nsfw_media_acknowledged = False,
                      ignorereports = False,
                      pref_show_promote = None,
                      gold = False,
@@ -152,9 +156,15 @@ class Account(Thing):
                      admin_takedown_strikes=0,
                      pref_threaded_modmail=False,
                      in_timeout=False,
+                     has_used_mobile_app=False,
+                     disable_karma=False,
                      )
     _preference_attrs = tuple(k for k in _defaults.keys()
                               if k.startswith("pref_"))
+
+    @classmethod
+    def _cache_prefix(cls):
+        return "account:"
 
     def preferences(self):
         return {pref: getattr(self, pref) for pref in self._preference_attrs}
@@ -185,18 +195,39 @@ class Account(Thing):
             for k, v in self._t.iteritems():
                 if k.endswith(suffix):
                     total += v
+
+            # link karma includes both "link" and "self" values
+            if kind == "link":
+                total += self.karma("self")
+
             return total
+
+        # if positive karma overall, default to MIN_UP_KARMA instead of 0
+        if self.karma(kind) > 0:
+            default_karma = g.MIN_UP_KARMA
         else:
-            try:
-                return getattr(self, sr.name + suffix)
-            except AttributeError:
-                #if positive karma elsewhere, you get min_up_karma
-                if self.karma(kind) > 0:
-                    return g.MIN_UP_KARMA
-                else:
-                    return 0
+            default_karma = 0
+
+        if kind == "link":
+            # link karma includes both "link" and "self", so it's a bit trickier
+            link_karma = getattr(self, sr.name + suffix, None)
+            self_karma = getattr(self, "%s_self_karma" % sr.name, None)
+
+            # return default value only if they have *neither* link nor self
+            if all(karma is None for karma in (link_karma, self_karma)):
+                return default_karma
+
+            return sum(karma for karma in (link_karma, self_karma) if karma)
+        else:
+            return getattr(self, sr.name + suffix, default_karma)
 
     def incr_karma(self, kind, sr, amt):
+        # accounts can (manually) have their ability to gain/lose karma
+        # disabled, to prevent special accounts like AutoModerator from
+        # having a massive number of subreddit-karma attributes
+        if self.disable_karma:
+            return
+
         if sr.name.startswith('_'):
             g.log.info("Ignoring karma increase for subreddit %r" % (sr.name,))
             return
@@ -225,6 +256,7 @@ class Account(Thing):
         descending.
         """
         link_suffix = '_link_karma'
+        self_suffix = '_self_karma'
         comment_suffix = '_comment_karma'
 
         comment_karmas = Counter()
@@ -234,7 +266,11 @@ class Account(Thing):
         for key, value in self._t.iteritems():
             if key.endswith(link_suffix):
                 sr_name = key[:-len(link_suffix)]
-                link_karmas[sr_name] = value
+                link_karmas[sr_name] += value
+            elif key.endswith(self_suffix):
+                # self karma gets added to link karma too
+                sr_name = key[:-len(self_suffix)]
+                link_karmas[sr_name] += value
             elif key.endswith(comment_suffix):
                 sr_name = key[:-len(comment_suffix)]
                 comment_karmas[sr_name] = value
@@ -278,16 +314,12 @@ class Account(Thing):
         timer.stop()
 
     def make_cookie(self, timestr=None):
-        if not self._loaded:
-            self._load()
         timestr = timestr or time.strftime(COOKIE_TIMESTAMP_FORMAT)
         id_time = str(self._id) + ',' + timestr
         to_hash = ','.join((id_time, self.password, g.secrets["SECRET"]))
         return id_time + ',' + hashlib.sha1(to_hash).hexdigest()
 
     def make_admin_cookie(self, first_login=None, last_request=None):
-        if not self._loaded:
-            self._load()
         first_login = first_login or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         last_request = last_request or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         hashable = ','.join((first_login, last_request, request.ip, request.user_agent, self.password))
@@ -295,9 +327,6 @@ class Account(Thing):
         return ','.join((first_login, last_request, mac))
 
     def make_otp_cookie(self, timestamp=None):
-        if not self._loaded:
-            self._load()
-
         timestamp = timestamp or datetime.utcnow().strftime(COOKIE_TIMESTAMP_FORMAT)
         secrets = [request.user_agent, self.otp_secret, self.password]
         signature = hmac.new(g.secrets["SECRET"], ','.join([timestamp] + secrets), hashlib.sha1).hexdigest()
@@ -337,15 +366,18 @@ class Account(Thing):
             return False
 
         return True
-    
+
     @classmethod
     @memoize('account._by_name')
-    def _by_name_cache(cls, name, allow_deleted = False):
+    def _by_name_cache(cls, name, allow_deleted=False):
         #relower name here, just in case
         deleted = (True, False) if allow_deleted else False
-        q = cls._query(lower(Account.c.name) == name.lower(),
-                       Account.c._spam == (True, False),
-                       Account.c._deleted == deleted)
+        q = cls._query(
+            lower(cls.c.name) == name.lower(),
+            cls.c._spam == (True, False),
+            cls.c._deleted == deleted,
+            data=True,
+        )
 
         q._limit = 1
         l = list(q)
@@ -357,7 +389,7 @@ class Account(Thing):
         #lower name here so there is only one cache
         uid = cls._by_name_cache(name.lower(), allow_deleted, _update = _update)
         if uid:
-            return cls._byID(uid, True)
+            return cls._byID(uid, data=True)
         else:
             raise NotFound, 'Account %s' % name
 
@@ -408,8 +440,11 @@ class Account(Thing):
     # Used on the goldmember version of /prefs/friends
     @memoize('account.friend_rels')
     def friend_rels_cache(self):
-        q = Friend._query(Friend.c._thing1_id == self._id,
-                          Friend.c._name == 'friend')
+        q = Friend._query(
+            Friend.c._thing1_id == self._id,
+            Friend.c._name == 'friend',
+            thing_data=True,
+        )
         return list(f._id for f in q)
 
     def friend_rels(self, _update = False):
@@ -423,20 +458,12 @@ class Account(Thing):
             if _update:
                 raise
             else:
-                log_text("friend-rels-bandaid 1",
-                         "Had to recalc friend_rels (1) for %s" % self.name,
-                         "warning")
                 return self.friend_rels(_update=True)
 
         if not _update:
             sorted_1 = sorted([r._thing2_id for r in rels])
             sorted_2 = sorted(list(self.friends))
             if sorted_1 != sorted_2:
-                g.log.error("FR1: %r" % sorted_1)
-                g.log.error("FR2: %r" % sorted_2)
-                log_text("friend-rels-bandaid 2",
-                         "Had to recalc friend_rels (2) for %s" % self.name,
-                         "warning")
                 self.friend_ids(_update=True)
                 return self.friend_rels(_update=True)
         return dict((r._thing2_id, r) for r in rels)
@@ -451,7 +478,7 @@ class Account(Thing):
         friend_ids = self.friend_ids()
         if len(friend_ids) <= limit:
             return friend_ids
-        
+
         with g.stats.get_timer("friends_query.%s" % data_value_name):
             result = self.sort_ids_by_data_value(
                 friend_ids, data_value_name, limit=limit, desc=True)
@@ -481,31 +508,12 @@ class Account(Thing):
         except NotFound:
             pass
 
-        # Mark this account for scrubbing
+        # Mark this account for immediate cleanup tasks
         amqp.add_item('account_deleted', self._fullname)
 
-        #remove from friends lists
-        q = Friend._query(Friend.c._thing2_id == self._id,
-                          Friend.c._name == 'friend',
-                          eager_load = True)
-        for f in q:
-            f._thing1.remove_friend(f._thing2)
-
-        q = Friend._query(Friend.c._thing2_id == self._id,
-                          Friend.c._name == 'enemy',
-                          eager_load=True)
-        for f in q:
-            f._thing1.remove_enemy(f._thing2)
-
-        # wipe out stored password data after a recovery period
+        # schedule further cleanup after a possible recovery period
         TryLater.schedule("account_deletion", self._id36,
                           delay=timedelta(days=90))
-
-        # Remove OAuth2Client developer permissions.  This will delete any
-        # clients for which this account is the sole developer.
-        from r2.models.token import OAuth2Client
-        for client in OAuth2Client._by_developer(self):
-            client.remove_developer(self)
 
     # 'State' bitfield properties
     @property
@@ -522,7 +530,7 @@ class Account(Thing):
             # New PW doesn't matter, they can't log in with it anyway.
             # Even if their PW /was/ 'banned' for some reason, this
             # will change the salt and thus invalidate the cookies
-            change_password(self, 'banned') 
+            change_password(self, 'banned')
 
             # deauthorize all access tokens
             from r2.models.token import OAuth2AccessToken
@@ -630,10 +638,6 @@ class Account(Thing):
             ModAction.create(subreddit, set_by, action='editflair',
                 target=self, details=log_details)
 
-    def update_sr_activity(self, sr):
-        if not self._spam:
-            AccountsActiveBySR.touch(self, sr)
-
     def get_trophy_id(self, uid):
         '''Return the ID of the Trophy associated with the given "uid"
 
@@ -689,8 +693,6 @@ class Account(Thing):
 
         Returns None if no temp-timeout found.
         """
-        if not feature.is_enabled('timeouts'):
-            return None
         if not self.in_timeout:
             return None
 
@@ -706,12 +708,48 @@ class Account(Thing):
         if not expires:
             return 0
 
-        now = datetime.now(g.tz)
-        expire_date = expires - now
-        return expire_date.days + 1
+        # TryLater runs periodically, so if the suspension expires
+        # within that time, then the remaining number of days is 0
+        # which is the same as a permanent suspension. Return 1 day
+        # remaining if it already expired but the TryLater queue hasn't
+        # cleared it yet.
+        days_left = (expires - datetime.now(g.tz)).days + 1
+        return max(days_left, 1)
 
     def incr_admin_takedown_strikes(self, amt=1):
         return self._incr('admin_takedown_strikes', amt)
+
+    def get_style_override(self):
+        """Return the subreddit selected for reddit theme.
+
+        If the user has a theme selected and enabled and also has
+        the feature flag enabled, return the subreddit name.
+        Otherwise, return None.
+        """
+        # Experiment to change the default style to determine if
+        # engagement metrics change
+        if (feature.is_enabled("default_design") and
+                feature.variant("default_design") == "nautclassic"):
+            return "nautclassic"
+
+        if (feature.is_enabled("default_design") and
+                feature.variant("default_design") == "serene"):
+            return "serene"
+
+        # Reddit themes is not enabled for this user
+        if not feature.is_enabled('stylesheets_everywhere'):
+            return None
+
+        # Make sure they have the theme enabled
+        if not self.pref_enable_default_themes:
+            return None
+
+        return self.pref_default_theme_sr
+
+    def has_been_atoed(self):
+        """Return true if this account has ever been required to reset their password
+        """
+        return 'force_password_reset' in self._t
 
 
 class FakeAccount(Account):
@@ -816,7 +854,13 @@ def valid_password(a, password, compare_password=None):
 
     if compare_password.startswith('$2a$'):
         # it's bcrypt.
-        expected_hash = bcrypt.hashpw(password, compare_password)
+
+        try:
+            expected_hash = bcrypt.hashpw(password, compare_password)
+        except ValueError:
+            # password is invalid because it contains null characters
+            return False
+
         if not constant_time_compare(compare_password, expected_hash):
             return False
 
@@ -861,25 +905,38 @@ def change_password(user, newpassword):
     LastModified.touch(user._fullname, 'Password')
     return True
 
-#TODO reset the cache
+
 def register(name, password, registration_ip):
-    try:
-        a = Account._by_name(name)
-        raise AccountExists
-    except NotFound:
-        a = Account(name = name,
-                    password = bcrypt_password(password))
-        # new accounts keep the profanity filter settings until opting out
-        a.pref_no_profanity = True
-        a.registration_ip = registration_ip
-        a._commit()
+    # get a lock for registering an Account with this name to prevent
+    # simultaneous operations from creating multiple Accounts with the same name
+    with g.make_lock("account_register", "register_%s" % name.lower()):
+        try:
+            account = Account._by_name(name)
+            raise AccountExists
+        except NotFound:
+            account = Account(
+                name=name,
+                password=bcrypt_password(password),
+                # new accounts keep the profanity filter settings until opting out
+                pref_no_profanity=True,
+                registration_ip=registration_ip,
+            )
+            account._commit()
 
-        #clear the caches
-        Account._by_name(name, _update = True)
-        Account._by_name(name, allow_deleted = True, _update = True)
-        return a
+            # update Account._by_name to pick up this new name->Account
+            Account._by_name(name, _update=True)
+            Account._by_name(name, allow_deleted=True, _update=True)
 
-class Friend(Relation(Account, Account)): pass
+            return account
+
+
+class Friend(Relation(Account, Account)):
+    _cache = g.thingcache
+
+    @classmethod
+    def _cache_prefix(cls):
+        return "friend:"
+
 
 Account.__bases__ += (UserRel('friend', Friend, disable_reverse_ids_fn=True),
                       UserRel('enemy', Friend, disable_reverse_ids_fn=False))
@@ -904,30 +961,6 @@ class DeletedUser(FakeAccount):
             pass
         else:
             object.__setattr__(self, attr, val)
-
-class AccountsActiveBySR(tdb_cassandra.View):
-    _use_db = True
-    _connection_pool = 'main'
-    _ttl = timedelta(minutes=15)
-
-    _extra_schema_creation_args = dict(key_validation_class=ASCII_TYPE)
-
-    _read_consistency_level  = tdb_cassandra.CL.ONE
-    _write_consistency_level = tdb_cassandra.CL.ANY
-
-    @classmethod
-    def touch(cls, account, sr):
-        cls._set_values(sr._id36,
-                        {account._id36: ''})
-
-    @classmethod
-    def get_count(cls, sr, cached=True):
-        return cls.get_count_cached(sr._id36, _update=not cached)
-
-    @classmethod
-    @memoize('accounts_active', time=60)
-    def get_count_cached(cls, sr_id):
-        return cls._cf.get_count(sr_id)
 
 
 class BlockedSubredditsByAccount(tdb_cassandra.DenormalizedRelation):
@@ -960,14 +993,86 @@ class BlockedSubredditsByAccount(tdb_cassandra.DenormalizedRelation):
 
 
 @trylater_hooks.on("trylater.account_deletion")
-def on_account_deletion(data):
+def deleted_account_cleanup(data):
+    from r2.models import Subreddit
+    from r2.models.admin_notes import AdminNotesBySystem
+    from r2.models.flair import Flair
+    from r2.models.token import OAuth2Client
+
     for account_id36 in data.itervalues():
         account = Account._byID36(account_id36, data=True)
 
         if not account._deleted:
             continue
 
+        # wipe the account's password and email address
         account.password = ""
+        account.email = ""
+        account.email_verified = False
+
+        notes = ""
+
+        # "noisy" rel removals, we'll record all of these in the account's
+        # usernotes in case we need the information later
+        rel_removal_descriptions = {
+            "moderator": "Unmodded",
+            "moderator_invite": "Cancelled mod invite",
+            "contributor": "Removed as contributor",
+            "banned": "Unbanned",
+            "wikibanned": "Un-wikibanned",
+            "wikicontributor": "Removed as wiki contributor",
+        }
+        if account.has_subscribed:
+            rel_removal_descriptions["subscriber"] = "Unsubscribed"
+
+        for rel_type, description in rel_removal_descriptions.iteritems():
+            try:
+                ids_fn = getattr(Subreddit, "reverse_%s_ids" % rel_type)
+                sr_ids = ids_fn(account)
+
+                sr_names = []
+                srs = Subreddit._byID(sr_ids, data=True, return_dict=False)
+                for subreddit in srs:
+                    remove_fn = getattr(subreddit, "remove_" + rel_type)
+                    remove_fn(account)
+                    sr_names.append(subreddit.name)
+
+                if description and sr_names:
+                    sr_list = ", ".join(sr_names)
+                    notes += "* %s from %s\n" % (description, sr_list)
+            except Exception as e:
+                notes += "* Error cleaning up %s rels: %s\n" % (rel_type, e)
+
+        # silent rel removals, no record left in the usernotes
+        rel_classes = {
+            "flair": Flair,
+            "friend": Friend,
+            "enemy": Friend,
+        }
+
+        for rel_name, rel_cls in rel_classes.iteritems():
+            try:
+                rels = rel_cls._query(
+                    rel_cls.c._thing2_id == account._id,
+                    rel_cls.c._name == rel_name,
+                    eager_load=True,
+                )
+                for rel in rels:
+                    remove_fn = getattr(rel._thing1, "remove_" + rel_name)
+                    remove_fn(account)
+            except Exception as e:
+                notes += "* Error cleaning up %s rels: %s\n" % (rel_name, e)
+
+        # add the note with info about the major changes to the account
+        if notes:
+            AdminNotesBySystem.add(
+                system_name="user",
+                subject=account.name,
+                note="Account deletion cleanup summary:\n\n%s" % notes,
+                author="<automated>",
+                when=datetime.now(g.tz),
+            )
+
         account._commit()
 
 
@@ -975,9 +1080,9 @@ class AccountsByCanonicalEmail(tdb_cassandra.View):
     __metaclass__ = tdb_cassandra.ThingMeta
 
     _use_db = True
-    _compare_with = tdb_cassandra.UTF8_TYPE
+    _compare_with = UTF8_TYPE
     _extra_schema_creation_args = dict(
-        key_validation_class=tdb_cassandra.UTF8_TYPE,
+        key_validation_class=UTF8_TYPE,
     )
 
     @classmethod
@@ -1000,15 +1105,15 @@ class AccountsByCanonicalEmail(tdb_cassandra.View):
             return []
         account_id36s = cls.get_time_sorted_columns(canonical).keys()
         return Account._byID36(account_id36s, data=True, return_dict=False)
-    
+
 
 class SubredditParticipationByAccount(tdb_cassandra.DenormalizedRelation):
     _use_db = True
     _write_last_modified = False
     _views = []
     _extra_schema_creation_args = {
-        "key_validation_class": tdb_cassandra.ASCII_TYPE,
-        "default_validation_class": tdb_cassandra.DATE_TYPE,
+        "key_validation_class": ASCII_TYPE,
+        "default_validation_class": DATE_TYPE,
     }
 
     @classmethod
@@ -1026,8 +1131,8 @@ class QuarantinedSubredditOptInsByAccount(tdb_cassandra.DenormalizedRelation):
     _read_consistency_level = tdb_cassandra.CL.QUORUM
     _write_consistency_level = tdb_cassandra.CL.QUORUM
     _extra_schema_creation_args = {
-        "key_validation_class": tdb_cassandra.ASCII_TYPE,
-        "default_validation_class": tdb_cassandra.DATE_TYPE,
+        "key_validation_class": ASCII_TYPE,
+        "default_validation_class": DATE_TYPE,
     }
     _connection_pool = 'main'
     _views = []

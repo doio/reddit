@@ -31,7 +31,6 @@ from pylons import tmpl_context as c
 from pylons import app_globals as g
 from pylons.i18n import _
 
-from r2.config import feature
 from r2.lib import hooks
 from r2.lib.db import tdb_cassandra
 from r2.lib.db.thing import NotFound
@@ -381,10 +380,14 @@ class OAuth2Client(Token):
     max_developers = 20
     token_size = 10
     client_secret_size = 20
+    _bool_props = (
+        "deleted",
+    )
     _float_props = (
         "max_reqs_sec",
     )
     _defaults = dict(name="",
+                     deleted=False,
                      description="",
                      about_url="",
                      icon_url="",
@@ -489,8 +492,7 @@ class OAuth2Client(Token):
 
         clients = cls._byID(cba._values().keys())
         return [client for client in clients.itervalues()
-                if not getattr(client, 'deleted', False)
-                    and client.has_developer(account)]
+                if not client.deleted and client.has_developer(account)]
 
     @classmethod
     def _by_user(cls, account):
@@ -546,6 +548,9 @@ class OAuth2Client(Token):
 
     def is_confidential(self):
         return self.app_type not in self.PUBLIC_APP_TYPES
+
+    def is_first_party(self):
+        return self.has_developer(Account.system_user())
 
 
 class OAuth2ClientsByDeveloper(tdb_cassandra.View):
@@ -624,9 +629,12 @@ class OAuth2AccessToken(Token):
         return OAuth2AccessTokensByUser
 
     def _on_create(self):
-        """Updates the by-user view upon creation."""
+        hooks.get_hook("oauth2.create_token").call(token=self)
+
+        # update the by-user view
         if self.user_id:
             self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
+
         return super(OAuth2AccessToken, self)._on_create()
 
     def check_valid(self):
@@ -639,8 +647,11 @@ class OAuth2AccessToken(Token):
         # Is the OAuth2Client still valid?
         try:
             client = OAuth2Client._byID(self.client_id)
-            if getattr(client, 'deleted', False):
+            if client.deleted:
                 raise NotFound
+        except AttributeError:
+            g.log.error("bad token %s: %s", self, self._t)
+            raise
         except NotFound:
             return False
 
@@ -707,6 +718,13 @@ class OAuth2RefreshToken(OAuth2AccessToken):
 
     _type_prefix = None
     _ttl = None
+
+    def _on_create(self):
+        if self.user_id:
+            self._by_user_view()._set_values(str(self.user_id), {self._id: ''})
+
+        # skip OAuth2AccessToken._on_create to avoid "oauth2.create_token" hook
+        return Token._on_create(self)
 
     @classmethod
     def _by_user_view(cls):

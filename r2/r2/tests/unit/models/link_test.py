@@ -179,7 +179,7 @@ class LinkMock(Link):
         pass
 
     @classmethod
-    @patch('r2.models.link.cast_vote')
+    @patch('r2.lib.voting.cast_vote')
     def _submit(cls, cast_vote, *args, **kwargs):
         """A _submit that mocks calls we don't care about testing."""
         return super(LinkMock, cls)._submit(*args, **kwargs)
@@ -211,12 +211,20 @@ class SubredditMock(ThingMock):
     def name(self):
         return "linktests"
 
+    @property
+    def spam_selfposts(self):
+        return "high"
+
+    @property
+    def spam_links(self):
+        return "low"
+
 
 class TestSubmit(unittest.TestCase):
     def setUp(self):
         from r2.models import (
             LinksByAccount,
-            LinksByUrl,
+            LinksByUrlAndSubreddit,
             SubredditParticipationByAccount,
             SubredditsActiveForFrontPage,
         )
@@ -226,9 +234,9 @@ class TestSubmit(unittest.TestCase):
         SubredditsActiveForFrontPage.mark_new_post = MagicMock()
 
         self.links_by_url_add_link = MagicMock()
-        LinksByUrl.add_link = self.links_by_url_add_link
+        LinksByUrlAndSubreddit.add_link = self.links_by_url_add_link
         self.links_by_url_remove_link = MagicMock()
-        LinksByUrl.remove_link = self.links_by_url_remove_link
+        LinksByUrlAndSubreddit.remove_link = self.links_by_url_remove_link
 
     def test_new_self_post_has_url(self):
         l = LinkMock._submit(

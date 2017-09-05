@@ -88,7 +88,8 @@ multi_description_json_spec = VValidatedJSON.Object({
 
 
 class MultiApiController(RedditController):
-    on_validation_error = staticmethod(abort_with_error)
+    def on_validation_error(self, error):
+        abort_with_error(error, error.code or 400)
 
     def pre(self):
         set_extension(request.environ, "json")
@@ -109,16 +110,6 @@ class MultiApiController(RedditController):
     def GET_list_multis(self, user, expand_srs):
         """Fetch a list of public multis belonging to `username`"""
         multis = LabeledMulti.by_owner(user)
-        return self._format_multi_list(multis, c.user, expand_srs)
-
-    @require_oauth2_scope("read")
-    @validate(
-        sr=VSRByName('srname'),
-        expand_srs=VBoolean("expand_srs"),
-    )
-    def GET_list_sr_multis(self, sr, expand_srs):
-        """Fetch a list of public multis belonging to subreddit `srname`"""
-        multis = LabeledMulti.by_owner(sr)
         return self._format_multi_list(multis, c.user, expand_srs)
 
     @require_oauth2_scope("read")
@@ -148,29 +139,10 @@ class MultiApiController(RedditController):
         return self._format_multi(multi, expand_srs)
 
     def _check_new_multi_path(self, path_info):
-        if path_info['prefix'] == 'r':
-            return self._get_multi_sr_owner(path_info)
-
-        return self._get_multi_user_owner(path_info)
-
-    def _get_multi_user_owner(self, path_info):
         if path_info['owner'].lower() != c.user.name.lower():
             raise RedditError('MULTI_CANNOT_EDIT', code=403,
                               fields='multipath')
         return c.user
-
-    def _get_multi_sr_owner(self, path_info):
-        try:
-            sr = Subreddit._by_name(path_info['owner'])
-        except NotFound:
-            raise RedditError('SUBREDDIT_NOEXIST', code=404)
-
-        if (not sr.is_moderator_with_perms(c.user, 'config') and not
-                c.user_is_admin):
-            raise RedditError('MULTI_CANNOT_EDIT', code=403,
-                              fields='multipath')
-
-        return sr
 
     def _add_multi_srs(self, multi, sr_datas):
         srs = Subreddit._by_name(sr_data['name'] for sr_data in sr_datas)

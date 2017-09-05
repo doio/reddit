@@ -52,12 +52,12 @@ import r2.lib.utils as r2utils
 from r2.models import (
         Account, 
         All, 
+        AllMinus,
         DefaultSR,
         DomainSR, 
         FakeSubreddit, 
         Friends, 
         Link, 
-        ModContribSR,
         MultiReddit, 
         NotFound,
         Subreddit, 
@@ -337,7 +337,7 @@ class LinkSearchQuery(SolrSearchQuery):
     @staticmethod
     def _get_sr_restriction(sr):
         '''Return a solr-appropriate query string that restricts
-        results to only contain results from self.sr
+        results to only contain results from sr
         
         '''
         bq = []
@@ -356,9 +356,9 @@ class LinkSearchQuery(SolrSearchQuery):
                        Account._fullname_from_id36(r2utils.to36(id_))
                        for id_ in friend_ids]
             bq.extend(friends)
-        elif isinstance(sr, ModContribSR):
-            for sr_id in sr.sr_ids:
-                bq.append("sr_id:%s" % sr_id)
+        elif isinstance(sr, AllMinus):
+            for sr_id in sr.exclude_sr_ids:
+                bq.append("-sr_id:%s" % sr_id)
         elif not isinstance(sr, FakeSubreddit):
             bq = ["sr_id:%s" % sr._id]
         return ' OR '.join(bq)
@@ -703,27 +703,18 @@ def _progress_key(item):
     return "%s/%s" % (item._id, item._date)
 
 
-_REBUILD_INDEX_CACHE_KEY = "solrsearch_cursor_%s"
-
-
 def _rebuild_link_index(start_at=None, sleeptime=1, cls=Link,
                        uploader=SolrLinkUploader, estimate=50000000, 
                        chunk_size=1000):
-    cache_key = _REBUILD_INDEX_CACHE_KEY % uploader.__name__.lower()
     uploader = uploader()
 
-    if start_at is _REBUILD_INDEX_CACHE_KEY:
-        start_at = g.cache.get(cache_key)
-        if not start_at:
-            raise ValueError("Told me to use '%s' key, but it's not set" %
-                             cache_key)
+    q = cls._query(cls.c._deleted == (True, False), sort=desc('_date'))
 
-    q = cls._query(cls.c._deleted == (True, False),
-                   sort=desc('_date'), data=True)
     if start_at:
         after = cls._by_fullname(start_at)
         assert isinstance(after, cls)
         q._after(after)
+
     q = r2utils.fetch_things2(q, chunk_size=chunk_size)
     q = r2utils.progress(q, verbosity=1000, estimate=estimate, persec=True,
                          key=_progress_key)
@@ -742,7 +733,7 @@ def _rebuild_link_index(start_at=None, sleeptime=1, cls=Link,
         else:
             raise err
         last_update = chunk[-1]
-        g.cache.set(cache_key, last_update._fullname)
+        print "last updated %s" % last_update._fullname
         time.sleep(sleeptime)
 
 
@@ -840,17 +831,6 @@ class SolrSearchProvider(SearchProvider):
         amqp.handle_items('cloudsearch_changes', _run_changed, min_size=min_size,
                           limit=limit, drain=drain, sleep_time=sleep_time,
                           verbose=verbose)
-
-    def get_related_query(self, query, article, start, end, nsfw):
-        '''build related query in solr syntax'''
-
-        query = u"|".join(query.split())
-        query = u"title:'%s'" % query
-        nsfw = nsfw and u"nsfw:0" or u""
-        query = u"(%s timestamp:[%s TO %s] %s)" % (query, start, end, nsfw)
-        return g.search.SearchQuery(query, 
-                                    raw_sort="-text_relevance",
-                                    syntax="solr")
 
     def rebuild_link_index(self, start_at=None, sleeptime=1, cls=Link,
                            uploader=SolrLinkUploader, estimate=50000000, 

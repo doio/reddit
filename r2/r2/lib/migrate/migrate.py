@@ -61,45 +61,6 @@ def subscribe_to_blog_and_annoucements(filename):
                 print ("%d: didn't subscribe %s to %s" % (i, account.name, sr.name))
 
 
-def upgrade_messages(update_comments = True, update_messages = True,
-                     update_trees = True):
-    from r2.lib.db import queries
-    from r2.lib import comment_tree, cache
-    from r2.models import Account
-    from pylons import app_globals as g
-    accounts = set()
-
-    def batch_fn(items):
-        g.reset_caches()
-        return items
-    
-    if update_messages or update_trees:
-        q = Message._query(Message.c.new == True,
-                           sort = desc("_date"),
-                           data = True)
-        for m in fetch_things2(q, batch_fn = batch_fn):
-            print m,m._date
-            if update_messages:
-                accounts = accounts | queries.set_unread(m, m.new)
-            else:
-                accounts.add(m.to_id)
-    if update_comments:
-        q = Comment._query(Comment.c.new == True,
-                           sort = desc("_date"))
-        q._filter(Comment.c._id < 26152162676)
-
-        for m in fetch_things2(q, batch_fn = batch_fn):
-            print m,m._date
-            queries.set_unread(m, True)
-
-    print "Precomputing comment trees for %d accounts" % len(accounts)
-
-    for i, a in enumerate(accounts):
-        if not isinstance(a, Account):
-            a = Account._byID(a)
-        print i, a
-        comment_tree.user_messages(a)
-
 def recompute_unread(min_date = None):
     from r2.models import Inbox, Account, Comment, Message
     from r2.lib.db import queries
@@ -225,7 +186,7 @@ def pushup_permacache(verbosity=1000):
 
 
 def port_cassaurls(after_id=None, estimate=15231317):
-    from r2.models import Link, LinksByUrl
+    from r2.models import Link, LinksByUrlAndSubreddit
     from r2.lib.db import tdb_cassandra
     from r2.lib.db.operators import desc
     from r2.lib.db.tdb_cassandra import CL
@@ -243,11 +204,8 @@ def port_cassaurls(after_id=None, estimate=15231317):
     chunks = in_chunks(q, 500)
 
     for chunk in chunks:
-        with LinksByUrl._cf.batch(write_consistency_level = CL.ONE) as b:
-            for l in chunk:
-                k = LinksByUrl._key_from_url(l.url)
-                if k:
-                    b.insert(k, {l._id36: l._id36})
+        for l in chunk:
+            LinksByUrlAndSubreddit.add_link(l)
 
 def port_deleted_links(after_id=None):
     from r2.models import Link

@@ -27,7 +27,7 @@ import pytz
 import uuid
 
 from pycassa import NotFoundException
-from pycassa.system_manager import INT_TYPE, UTF8_TYPE
+from pycassa.system_manager import ASCII_TYPE, INT_TYPE, TIME_UUID_TYPE, UTF8_TYPE
 from pycassa.util import convert_uuid_to_time
 from pylons import tmpl_context as c
 from pylons import app_globals as g
@@ -168,8 +168,8 @@ class GildedLinksByAccount(tdb_cassandra.DenormalizedRelation):
 class GildingsByThing(tdb_cassandra.View):
     _use_db = True
     _extra_schema_creation_args = {
-        "key_validation_class": tdb_cassandra.UTF8_TYPE,
-        "column_name_class": tdb_cassandra.UTF8_TYPE,
+        "key_validation_class": UTF8_TYPE,
+        "column_name_class": UTF8_TYPE,
     }
 
     @classmethod
@@ -192,11 +192,11 @@ class GildingsByThing(tdb_cassandra.View):
 @view_of(GildedLinksByAccount)
 class GildingsByDay(tdb_cassandra.View):
     _use_db = True
-    _compare_with = tdb_cassandra.TIME_UUID_TYPE
+    _compare_with = TIME_UUID_TYPE
     _extra_schema_creation_args = {
-        "key_validation_class": tdb_cassandra.ASCII_TYPE,
-        "column_name_class": tdb_cassandra.TIME_UUID_TYPE,
-        "default_validation_class": tdb_cassandra.UTF8_TYPE,
+        "key_validation_class": ASCII_TYPE,
+        "column_name_class": TIME_UUID_TYPE,
+        "default_validation_class": UTF8_TYPE,
     }
 
     @staticmethod
@@ -324,7 +324,7 @@ def create_gold_code(trans_id, payer_email, paying_id, pennies, days, date):
                 date=date)
             return code
 
-                
+
 def account_by_payingid(paying_id):
     s = sa.select([sa.distinct(gold_table.c.account_id)],
                   gold_table.c.paying_id == paying_id)
@@ -468,20 +468,25 @@ def gold_revenue_multi(dates):
                 for truncated_time, pennies in ENGINE.execute(query)}
 
 
-@memoize("gold-revenue-volatile", time=600)
+@memoize("gold-revenue-volatile", time=600, stale=True)
 def gold_revenue_volatile(date):
     return gold_revenue_multi([date]).get(date, 0)
 
 
-@memoize("gold-revenue-steady")
+@memoize("gold-revenue-steady", stale=True)
 def gold_revenue_steady(date):
     return gold_revenue_multi([date]).get(date, 0)
 
 
-@memoize("gold-goal")
+@memoize("gold-goal", stale=True)
 def gold_goal_on(date):
     """Returns the gold revenue goal (in pennies) for a given date."""
-    return GoldRevenueGoalByDate.get(date)
+    goal = GoldRevenueGoalByDate.get(date)
+
+    if not goal:
+        return 0
+
+    return float(goal)
 
 
 def account_from_stripe_customer_id(stripe_customer_id):

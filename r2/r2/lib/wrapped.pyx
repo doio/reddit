@@ -20,13 +20,20 @@
 # Inc. All Rights Reserved.
 ###############################################################################
 
-from itertools import chain
+
 from datetime import datetime
-import re, types
-
 from hashlib import md5
+from itertools import chain
+import random
+import re
+import types
 
-RENDER_CACHE_SAMPLE_RATE = 0.001
+from r2.lib.cache import MemcachedError
+from r2.lib.utils import SimpleSillyStub
+
+
+CACHE_HIT_SAMPLE_RATE = 0.001
+RENDER_TIMER_SAMPLE_RATE = 0.001
 
 class _TemplateUpdater(object):
     # this class is just a hack to get around Cython's closure rules
@@ -187,29 +194,27 @@ class Templated(object):
         from pylons import tmpl_context as c
         from pylons import app_globals as g
 
-        if self.render_class_name in g.timed_templates:
-            timer = g.stats.get_timer('render.%s.nocache' %
-                                      self.render_class_name,
-                                      publish=False)
-            timer.start()
+        if (self.cachable and
+                style != "api" and
+                random.random() < RENDER_TIMER_SAMPLE_RATE):
+            timer = g.stats.get_timer(name="render.%s" % self.render_class_name)
         else:
-            timer = None
+            timer = SimpleSillyStub()
 
-        # the style has to default to the global render style
-        # fetch template
+        timer.start()
         template = self.template(style)
-        if timer: timer.intermediate('template')
-        # store the global render style (since child templates)
+
+        # store the global render style (child templates might override it)
         render_style = c.render_style
         c.render_style = style
-        # render the template
-        res = template.render(thing = self)
-        if timer: timer.intermediate('render')
+
+        res = template.render(thing=self)
         if not isinstance(res, StringTemplate):
             res = StringTemplate(res)
+
         # reset the global render style
         c.render_style = render_style
-        if timer: timer.stop()
+        timer.stop()
         return res
 
     def _render(self, style, **kwargs):
@@ -235,11 +240,9 @@ class Templated(object):
         """
         from pylons import tmpl_context as c
         from pylons import app_globals as g
-        timer = g.stats.get_timer('render.%s.cached' % self.render_class_name,
-                                  publish=False)
-        timer.start()
 
         style = style or c.render_style or 'html'
+
         # prepare (and store) the list of cachable items. 
         primary = False
         if not isinstance(c.render_tracker, dict):
@@ -261,7 +264,6 @@ class Templated(object):
         else:
             # either a primary template or not cachable, so render it
             res = self.render_nocache(style)
-        timer.intermediate('self-render')
 
         # if this is the primary template, let the caching games begin
         if primary:
@@ -283,7 +285,6 @@ class Templated(object):
                 # This dict cast will generate a new dict of cache_key
                 # to value
                 cached = self._read_cache(dict(current.values()))
-                timer.intermediate('fetch-cache')
                 # replacements will be a map of key -> rendered content
                 # for updateing the current set of updates
                 replacements = {}
@@ -304,13 +305,12 @@ class Templated(object):
                     event_name = 'render-cache.%s' % item.render_class_name
                     name = 'hit' if cache_key in cached else 'miss'
                     g.stats.event_count(
-                        event_name, name, sample_rate=RENDER_CACHE_SAMPLE_RATE)
+                        event_name, name, sample_rate=CACHE_HIT_SAMPLE_RATE)
 
                     # store the unevaluated templates in
                     # cached for caching
                     replacements[key] = r.finalize(kw)
                     new_updates[key] = (cache_key, (r, kw))
-                timer.intermediate('sub-render')
 
                 # update the updates so that when we can do the
                 # replacement in one pass.
@@ -336,12 +336,10 @@ class Templated(object):
                 if k in to_cache:
                     _to_cache[k] = v
             self._write_cache(_to_cache)
-            timer.intermediate('write-cache')
 
             # edge case: this may be the primary tempalte and cachable
             if isinstance(res, CacheStub):
                 res = updates[res.name][1][0]
-            timer.intermediate('replace')
 
             # now we can update the updates to make use of their kw args.
             _updates = {}
@@ -363,17 +361,11 @@ class Templated(object):
 
             # wipe out the render tracker object
             c.render_tracker = None
-            timer.stop()
         elif not isinstance(res, CacheStub):
             # we're done.  Update the template based on the args passed in
             res = res.finalize(kwargs)
-            # timings for non-primary templates will not be sent.
-        
-        return res
 
-    def _cache_key(self, key):
-        return 'render_%s(%s)' % (self.__class__.__name__,
-                                  md5(key).hexdigest())
+        return res
 
     def _write_cache(self, keys):
         from pylons import app_globals as g
@@ -381,22 +373,16 @@ class Templated(object):
         if not keys:
             return
 
-        toset = {}
-        for key, val in keys.iteritems():
-            toset[self._cache_key(key)] = val
-
-        g.rendercache.set_multi(toset)
+        try:
+            g.rendercache.set_multi(keys, time=3600)
+        except MemcachedError as e:
+            g.log.warning("rendercache error: %s", e)
+            return
 
     def _read_cache(self, keys):
         from pylons import app_globals as g
 
-        ekeys = {}
-        for key in keys:
-            ekeys[self._cache_key(key)] = key
-        found = g.rendercache.get_multi(ekeys)
-        ret = {}
-        for fkey, val in found.iteritems():
-            ret[ekeys[fkey]] = val
+        ret = g.rendercache.get_multi(keys)
         return ret
 
     def render(self, style = None, **kw):
@@ -468,7 +454,6 @@ class CachedTemplate(Templated):
             c.domain_prefix,
             style,
             c.secure,
-            c.cname,
             c.lang,
             c.site.user_path,
             self.template_hash(style),
@@ -483,7 +468,8 @@ class CachedTemplate(Templated):
         auto_keys = [(k,  make_cachable(v, style))
                      for k, v in self.cachable_attrs()]
         keys.append(repr(auto_keys))
-        return "<%s:[%s]>" % (self.__class__.__name__, u''.join(keys))
+        h = md5(u''.join(keys)).hexdigest()
+        return "rend:%s:%s" % (self.render_class_name, h)
 
 
 class Wrapped(CachedTemplate):

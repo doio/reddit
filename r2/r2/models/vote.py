@@ -181,9 +181,6 @@ class Vote(object):
         if self.thing.num_votes < 20 or self.thing.num_votes % 10 == 0:
             self.thing.update_search_index(boost_only=True)
 
-        from r2.lib.db.queries import new_vote
-        new_vote(self)
-
         if self.event_data:
             g.events.vote_event(self)
 
@@ -257,6 +254,8 @@ class VoteEffects(object):
 
     def determine_affects_karma(self, vote):
         """Determine whether the vote should affect the author's karma."""
+        from r2.models import Comment
+
         if not self.affects_score:
             return False
 
@@ -268,6 +267,14 @@ class VoteEffects(object):
         if not bool(vote.thing.affects_karma_type):
             self.add_note("KARMALESS_THING")
             return False
+
+        # never give karma on stickied comments. Only check distinguished
+        # comments to avoid fetching the link on most votes, for performance.
+        if isinstance(vote.thing, Comment) and vote.thing.is_distinguished:
+            link = vote.thing.link_slow
+            if vote.thing._id == link.sticky_comment_id:
+                self.add_note("COMMENT_STICKIED")
+                return False
 
         if self.validator:
             affects_karma = self.validator.determine_affects_karma()
@@ -461,60 +468,9 @@ class VoteDetailsByComment(VoteDetailsByThing):
     _use_db = True
 
 
-class VoteDetailsByDay(tdb_cassandra.View):
-    _use_db = False
-    _fetch_all_columns = True
-    _write_consistency_level = tdb_cassandra.CL.ONE
-    _compare_with = CompositeType(AsciiType(), AsciiType())
-    _extra_schema_creation_args = {
-        "key_validation_class": ASCII_TYPE,
-        "default_validation_class": UTF8_TYPE,
-    }
-    TIMEZONE = pytz.timezone("America/Los_Angeles")
-
-    @classmethod
-    def _rowkey(cls, vote):
-        return cls._rowkey_by_datetime(vote.date)
-
-    @classmethod
-    def _rowkey_by_datetime(cls, date):
-        return date.astimezone(cls.TIMEZONE).strftime("%Y-%m-%d")
-
-    @classmethod
-    def create(cls, user, thing, vote):
-        # we don't use the user or thing args, but they need to be there for
-        # calling this automatically when updating views of a DenormalizedRel
-        colname = (vote.user._id36, vote.thing._id36)
-        data = json.dumps({
-            "direction": Vote.serialize_direction(vote.direction),
-            "date": int(epoch_timestamp(vote.date)),
-        })
-        cls._set_values(cls._rowkey(vote), {colname: data})
-
-    @classmethod
-    def count_votes(cls, date):
-        """Return the number of votes made on a particular date."""
-        # convert the date to a datetime in the correct timezone
-        date = datetime(date.year, date.month, date.day, tzinfo=cls.TIMEZONE)
-
-        # manually count up the number of columns instead of using get_count()
-        # because the large number of columns tends to result in RPC timeouts
-        return sum(1 for x in cls._cf.xget(cls._rowkey_by_datetime(date)))
-
-
-@tdb_cassandra.view_of(LinkVotesByAccount)
-class LinkVoteDetailsByDay(VoteDetailsByDay):
-    _use_db = True
-
-
-@tdb_cassandra.view_of(CommentVotesByAccount)
-class CommentVoteDetailsByDay(VoteDetailsByDay):
-    _use_db = True
-
-
 class VoterIPByThing(tdb_cassandra.View):
     _use_db = True
-    _ttl = timedelta(days=90)
+    _ttl = timedelta(days=100)
     _fetch_all_columns = True
     _extra_schema_creation_args = dict(key_validation_class=ASCII_TYPE,
                                        default_validation_class=UTF8_TYPE)
@@ -528,7 +484,7 @@ class VoteNote(tdb_cassandra.View):
     _use_db = True
     _connection_pool = 'main'
     _compare_with = TIME_UUID_TYPE
-    _ttl = timedelta(days=90)
+    _ttl = timedelta(days=100)
 
     @classmethod
     def _rowkey(cls, vote):

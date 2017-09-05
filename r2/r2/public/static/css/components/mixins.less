@@ -1,5 +1,7 @@
 .animation (@animation) {
     -webkit-animation: @animation;
+    -moz-animation: @animation;
+    -ms-animation: @animation;
     -o-animation: @animation;
     animation: @animation;
 }
@@ -77,6 +79,11 @@
 .flex-wrap(@props) {
   -webkit-flex-wrap: @props;
   flex-wrap: @props;
+}
+
+.flex-direction(@props) {
+  -webkit-flex-direction: @props;
+  flex-direction: @props;
 }
 
 .display-flex() {

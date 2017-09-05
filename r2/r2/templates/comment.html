@@ -40,11 +40,24 @@ ${parent.midcol(cls = cls)}
 
 <%def name="subreddit()" buffered="True">
   ${plain_link(thing.subreddit.name, thing.subreddit_path, _sr_path=False,
-               nocname=True, _class="subreddit hover")}
+               _class="subreddit hover")}
 </%def>
 
 <%def name="link()" buffered="True">
-  <a href="${thing.link.url}" class="title"
+  <%
+
+    if thing.link.is_self:
+      url = thing.link.url
+      inbound_tracking_url = thing.link.tracking_link(url, thing, "title", site_name=False)
+    else:
+      url = thing.link.url
+      inbound_tracking_url = None
+  %>
+  <a href="${url}" class="title"
+     %if inbound_tracking_url and inbound_tracking_url != url:
+       data-inbound-url="${inbound_tracking_url}"
+       data-href-url="${url}"
+     %endif
      %if thing.nofollow:
        rel="nofollow"
      %endif
@@ -106,6 +119,11 @@ ${parent.midcol(cls = cls)}
   ${thing_timestamp(thing, thing.timesince, live=True, include_tense=True)}
   ${edited(thing, thing.lastedited)}
   ${self.gildings()}
+
+  %if thing.is_sticky:
+  &#32;
+  <span class="stickied-tagline" title="${_("selected by this subreddit's moderators")}">${_("stickied comment")}</span>
+  %endif
 
   &nbsp;
   <a href="javascript:void(0)" class="numchildren" onclick="return togglecomment(this)">

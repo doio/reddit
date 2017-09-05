@@ -51,6 +51,7 @@ from r2.lib.providers.search.common import (
 import r2.lib.utils as r2utils
 from r2.models import (
     Account,
+    AllMinus,
     DomainSR,
     FakeSubreddit,
     FriendsSR,
@@ -315,14 +316,14 @@ def chunk_xml(xml, depth=0):
         right_half = etree.Element("batch")
         # etree magic simultaneously removes the elements from one tree
         # when they are appended to a different tree
-        right_half.append(xml[half:])
+        right_half.extend(xml[half:])
         for chunk in chunk_xml(left_half, depth=depth):
             yield chunk
         for chunk in chunk_xml(right_half, depth=depth):
             yield chunk
 
 
-@g.stats.amqp_processor('cloudsearch_q')
+@g.stats.amqp_processor('cloudsearch_changes')
 def _run_changed(msgs, chan):
     '''Consume the cloudsearch_changes queue, and print reporting information
     on how long it took and how many remain
@@ -369,28 +370,19 @@ def _progress_key(item):
     return "%s/%s" % (item._id, item._date)
 
 
-_REBUILD_INDEX_CACHE_KEY = "cloudsearch_cursor_%s"
-
-
 def rebuild_link_index(start_at=None, sleeptime=1, cls=Link,
                        uploader=LinkUploader, doc_api='CLOUDSEARCH_DOC_API',
                        estimate=50000000, chunk_size=1000):
-    cache_key = _REBUILD_INDEX_CACHE_KEY % uploader.__name__.lower()
     doc_api = getattr(g, doc_api)
     uploader = uploader(doc_api)
 
-    if start_at is _REBUILD_INDEX_CACHE_KEY:
-        start_at = g.cache.get(cache_key)
-        if not start_at:
-            raise ValueError("Told me to use '%s' key, but it's not set" %
-                             cache_key)
+    q = cls._query(cls.c._deleted == (True, False), sort=desc('_date'))
 
-    q = cls._query(cls.c._deleted == (True, False),
-                   sort=desc('_date'), data=True)
     if start_at:
         after = cls._by_fullname(start_at)
         assert isinstance(after, cls)
         q._after(after)
+
     q = r2utils.fetch_things2(q, chunk_size=chunk_size)
     q = r2utils.progress(q, verbosity=1000, estimate=estimate, persec=True,
                          key=_progress_key)
@@ -408,7 +400,7 @@ def rebuild_link_index(start_at=None, sleeptime=1, cls=Link,
         else:
             raise err
         last_update = chunk[-1]
-        g.cache.set(cache_key, last_update._fullname)
+        print "last updated %s" % last_update._fullname
         time.sleep(sleeptime)
 
 
@@ -548,7 +540,7 @@ class CloudSearchQuery(object):
 
     def __init__(self, query, sr=None, sort=None, syntax=None, raw_sort=None,
                  faceting=None, recent=None, include_over18=True,
-                 rank_expressions=None, bypass_l2cs=False, start=0, num=1000):
+                 rank_expressions=None, start=0, num=1000):
         if syntax is None:
             syntax = self.default_syntax
         elif syntax not in self.known_syntaxes:
@@ -575,7 +567,6 @@ class CloudSearchQuery(object):
         else:
             self.sort = self.sorts.get(sort)
         self.rank_expressions = rank_expressions
-        self.bypass_l2cs = bypass_l2cs
 
         # pagination
         self.start = start
@@ -597,18 +588,9 @@ class CloudSearchQuery(object):
         if self.syntax == "cloudsearch":
             self.bq = self.customize_query(query)
         elif self.syntax == "lucene":
-            # For the most part, conversion to cloudsearch structured query syntax
-            # is not needed, except for fielded searches using ":" and boolean
-            # searches using AND/OR/NOT (in order to avoid transforming the query)
-            lucene_operators = (':', ' AND ', ' OR ', ' NOT ')
-            if (self.bypass_l2cs
-                    and not any(op in query for op in lucene_operators)):
-                self.q = query.encode('utf-8')
-                self.bq = self.customize_query()
-            else:
-                bq = l2cs.convert(query, self.lucene_parser)
-                self.converted_data = {"syntax": "cloudsearch", "converted": bq}
-                self.bq = self.customize_query(bq)
+            bq = l2cs.convert(query, self.lucene_parser)
+            self.converted_data = {"syntax": "cloudsearch", "converted": bq}
+            self.bq = self.customize_query(bq)
         elif self.syntax == "plain":
             self.q = query.encode('utf-8')
             self.bq = self.customize_query()
@@ -746,12 +728,6 @@ class LinkSearchQuery(CloudSearchQuery):
     known_syntaxes = g.search_syntaxes
     default_syntax = "lucene"
 
-    def __init__(self, *args, **kwargs):
-        if kwargs.get('sort') == 'relevance2':
-            kwargs['bypass_l2cs'] = True
-            kwargs['raw_sort'] = '-relevance2'
-        super(LinkSearchQuery, self).__init__(*args, **kwargs)
-
     def customize_query(self, bq=u''):
         queries = []
         if bq:
@@ -776,7 +752,7 @@ class LinkSearchQuery(CloudSearchQuery):
     @staticmethod
     def _restrict_sr(sr):
         '''Return a cloudsearch appropriate query string that restricts
-        results to only contain results from self.sr
+        results to only contain results from sr
         
         '''
         if isinstance(sr, MultiReddit):
@@ -785,7 +761,7 @@ class LinkSearchQuery(CloudSearchQuery):
             srs = ["sr_id:%s" % sr_id for sr_id in sr.sr_ids]
             return "(or %s)" % ' '.join(srs)
         elif isinstance(sr, DomainSR):
-            return "site:'%s'" % sr.domain
+            return "site:'\"%s\"'" % sr.domain
         elif isinstance(sr, FriendsSR):
             if not c.user_is_loggedin or not c.user.friends:
                 raise InvalidQuery
@@ -796,6 +772,11 @@ class LinkSearchQuery(CloudSearchQuery):
                        Account._fullname_from_id36(r2utils.to36(id_))
                        for id_ in friend_ids]
             return "(or %s)" % ' '.join(friends)
+        elif isinstance(sr, AllMinus):
+            if not sr.exclude_sr_ids:
+                raise InvalidQuery
+            exclude_srs = ["sr_id:%s" % sr_id for sr_id in sr.exclude_sr_ids]
+            return "(not (or %s))" % ' '.join(exclude_srs)
         elif not isinstance(sr, FakeSubreddit):
             return "sr_id:%s" % sr._id
 
@@ -845,15 +826,3 @@ class CloudSearchProvider(SearchProvider):
         amqp.handle_items('cloudsearch_changes', _run_changed, min_size=min_size,
                           limit=limit, drain=drain, sleep_time=sleep_time,
                           verbose=verbose)
-    
-    def get_related_query(self, query, article, start, end, nsfw):
-        '''build related query in cloudsearch syntax'''
-        query = _force_unicode(query)
-        query = query[:1024]
-        query = u"|".join(query.split())
-        query = u"title:'%s'" % query
-        nsfw = nsfw and u"nsfw:0" or u""
-        query = u"(and %s timestamp:%s..%s %s)" % (query, start, end, nsfw)
-        return g.search.SearchQuery(query, 
-                                    raw_sort="-text_relevance",
-                                    syntax="cloudsearch")

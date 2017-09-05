@@ -27,8 +27,15 @@ from r2.lib.errors import MessageError
 from r2.lib.utils import tup, fetch_things2
 from r2.lib.filters import websafe
 from r2.lib.hooks import HookRegistrar
-from r2.lib.log import log_text
-from r2.models import Account, Message, Report, Subreddit
+from r2.models import (
+    Account,
+    Comment,
+    Link,
+    Message,
+    NotFound,
+    Report,
+    Subreddit,
+)
 from r2.models.award import Award
 from r2.models.gold import append_random_bottlecap_phrase, creddits_lock
 from r2.models.token import AwardClaimToken
@@ -100,6 +107,15 @@ class AdminTools(object):
 
         queries.ban(all_things, filtered=auto)
 
+        for t in all_things:
+            if auto:
+                amqp.add_item("auto_removed", t._fullname)
+
+            if isinstance(t, Comment):
+                amqp.add_item("removed_comment", t._fullname)
+            elif isinstance(t, Link):
+                amqp.add_item("removed_link", t._fullname)
+
     def unspam(self, things, moderator_unbanned=True, unbanner=None,
                train_spam=True, insert=True):
         from r2.lib.db import queries
@@ -134,6 +150,11 @@ class AdminTools(object):
             else:
                 t.verdict = 'admin-approved'
             t._commit()
+
+            if isinstance(t, Comment):
+                amqp.add_item("approved_comment", t._fullname)
+            elif isinstance(t, Link):
+                amqp.add_item("approved_link", t._fullname)
 
         self.author_spammer(things, False)
         self.set_last_sr_ban(things)

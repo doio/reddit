@@ -165,7 +165,7 @@ class WikiRevision(tdb_cassandra.UuidThing, Printable):
         self.hidden = not self.is_hidden
         self._commit()
         return self.hidden
-    
+
     @classmethod
     def create(cls, pageid, content, author=None, reason=None):
         kw = dict(pageid=pageid, content=content)
@@ -175,14 +175,14 @@ class WikiRevision(tdb_cassandra.UuidThing, Printable):
             kw['reason'] = reason
         wr = cls(**kw)
         wr._commit()
-        WikiRevisionsByPage.add_object(wr)
+        WikiRevisionHistoryByPage.add_object(wr)
         WikiRevisionsRecentBySR.add_object(wr)
         return wr
-    
+
     def _on_commit(self):
-        WikiRevisionsByPage.add_object(self)
+        WikiRevisionHistoryByPage.add_object(self)
         WikiRevisionsRecentBySR.add_object(self)
-    
+
     @classmethod
     def get_recent(cls, sr, count=100):
         return WikiRevisionsRecentBySR.query([sr._id36], count=count)
@@ -249,18 +249,27 @@ class WikiPage(tdb_cassandra.Thing):
     @classmethod
     def get(cls, sr, name):
         return cls._byID(cls.id_for(sr, name))
-    
+
     @classmethod
     def create(cls, sr, name):
-        # Sanity check for a page name and subreddit
         if not name or not sr:
             raise ValueError
+
         name = name.lower()
-        kw = dict(sr=sr._id36, name=name, permlevel=0, content='')
-        page = cls(**kw)
-        page._commit()
-        return page
-    
+        _id = wiki_id(sr._id36, name)
+        lock_key = "wiki_create_%s:%s" % (sr._id36, name)
+        with g.make_lock("wiki", lock_key):
+            try:
+                cls._byID(_id)
+            except tdb_cassandra.NotFound:
+                pass
+            else:
+                raise WikiPageExists
+
+            page = cls(_id=_id, sr=sr._id36, name=name, permlevel=0, content='')
+            page._commit()
+            return page
+
     @property
     def restricted(self):
         return WikiPage.is_restricted(self.name)
@@ -410,31 +419,27 @@ class WikiPage(tdb_cassandra.Thing):
             raise ValueError('Permlevel not valid')
         self.permlevel = permlevel
         self._commit()
-    
-    def get_revisions(self, after=None, count=100):
-        return WikiRevisionsByPage.query([self._id], after=after, count=count)
-    
-    def _commit(self, *a, **kw):
-        if not self._id: # Creating a new page
-            pageid = wiki_id(self.sr, self.name)
-            try:
-                WikiPage._byID(pageid)
-                raise WikiPageExists()
-            except tdb_cassandra.NotFound:
-                self._id = pageid   
-        return tdb_cassandra.Thing._commit(self, *a, **kw)
 
-class WikiRevisionsByPage(tdb_cassandra.DenormalizedView):
-    """ Associate revisions with pages """
-    
+    def get_revisions(self, after=None, count=100):
+        return WikiRevisionHistoryByPage.query(
+            rowkeys=[self._id], after=after, count=count)
+
+
+class WikiRevisionHistoryByPage(tdb_cassandra.View):
+    """Create a time ordered index of revisions for a wiki page"""
     _use_db = True
     _connection_pool = 'main'
     _view_of = WikiRevision
     _compare_with = TIME_UUID_TYPE
-    
+
     @classmethod
-    def _rowkey(cls, wr):
-        return wr.pageid
+    def _rowkey(cls, wikirevision):
+        return wikirevision.pageid
+
+    @classmethod
+    def _obj_to_column(cls, wikirevision):
+        return {wikirevision._id: ''}
+
 
 class WikiPagesBySR(tdb_cassandra.DenormalizedView):
     """ Associate revisions with subreddits, store only recent """

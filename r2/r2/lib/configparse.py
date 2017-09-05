@@ -52,17 +52,29 @@ class ConfigValue(object):
         return tuple(ConfigValue.to_iter(v))
 
     @staticmethod
-    def tuple_of(value_type):
+    def set(v, key=None):
+        return set(ConfigValue.to_iter(v))
+
+    @staticmethod
+    def set_of(value_type, delim=','):
         def parse(v, key=None):
-            return tuple(value_type(x) for x in ConfigValue.to_iter(v))
+            return set(value_type(x)
+                       for x in ConfigValue.to_iter(v, delim=delim))
         return parse
 
     @staticmethod
-    def dict(key_type, value_type):
+    def tuple_of(value_type, delim=','):
         def parse(v, key=None):
-            return {key_type(x): value_type(y)
-                    for x, y in (
-                        i.split(':', 1) for i in ConfigValue.to_iter(v))}
+            return tuple(value_type(x)
+                         for x in ConfigValue.to_iter(v, delim=delim))
+        return parse
+
+    @staticmethod
+    def dict(key_type, value_type, delim=',', kvdelim=':'):
+        def parse(v, key=None):
+            values = (i.partition(kvdelim)
+                      for i in ConfigValue.to_iter(v, delim=delim))
+            return {key_type(x): value_type(y) for x, _,  y in values}
         return parse
 
     @staticmethod
@@ -91,6 +103,12 @@ class ConfigValue(object):
     @staticmethod
     def messages(v, key=None):
         return ConfigValue.messages_re.findall(v.decode("string_escape"))
+
+    @staticmethod
+    def baseplate(baseplate_parser):
+        def adapter(v, key=None):
+            return baseplate_parser(v)
+        return adapter
 
 
 class ConfigValueParser(dict):

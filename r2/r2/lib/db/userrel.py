@@ -23,6 +23,7 @@
 import functools
 import types
 
+from r2.lib.db.thing import CreationError
 from r2.lib.memoize import memoize
 
 
@@ -48,7 +49,12 @@ class UserRelManager(object):
         r = self.relation(thing, user, self.name, **attrs)
         if permissions is not None:
             r.set_permissions(permissions)
-        r._commit()
+
+        try:
+            r._commit()
+        except CreationError:
+            return None
+
         r._permission_class = self.permission_class
         return r
 
@@ -71,17 +77,31 @@ class UserRelManager(object):
             return self.add(thing, user, **attrs)
 
     def ids(self, thing):
-        return [r._thing2_id for r in self.by_thing(thing)]
+        q = self.relation._simple_query(
+            ["_thing2_id"],
+            self.relation.c._thing1_id == thing._id,
+            self.relation.c._name == self.name,
+            sort='_date',
+        )
+        return [r._thing2_id for r in q]
 
     def reverse_ids(self, user):
-        q = self.relation._query(self.relation.c._thing2_id == user._id,
-                                 self.relation.c._name == self.name)
+        q = self.relation._simple_query(
+            ["_thing1_id"],
+            self.relation.c._thing2_id == user._id,
+            self.relation.c._name == self.name,
+        )
         return [r._thing1_id for r in q]
 
-    def by_thing(self, thing, **kw):
-        for r in self.relation._query(self.relation.c._thing1_id == thing._id,
-                                      self.relation.c._name == self.name,
-                                      sort='_date', **kw):
+    def by_thing(self, thing):
+        q = self.relation._query(
+            self.relation.c._thing1_id == thing._id,
+            self.relation.c._name == self.name,
+            sort='_date',
+            data=True,
+        )
+
+        for r in q:
             r._permission_class = self.permission_class
             yield r
 
